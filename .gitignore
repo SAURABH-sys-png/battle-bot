@@ -198,3 +198,6 @@ gradle-app.setting
 .project
 # JDT-specific (Eclipse Java Development Tools)
 .classpath
+
+# Python virtualenv
+.venv/

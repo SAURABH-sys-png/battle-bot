@@ -74,9 +74,56 @@ class ZipFileWithPermissions(zipfile.ZipFile):
         return targetpath
 
 
+def patch_crossplay_latency():
+    """Patch the installed engine's socket code to avoid ~70ms of TCP stall per message.
+
+    The Java engine sends each message as two unbuffered writes without TCP_NODELAY, so
+    Nagle's algorithm holds the body until the header is ACKed, and Linux delays that ACK
+    by ~40ms. Same problem the other way round. Without this, matches run ~1 round/sec.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", "import battlecode26.crossplay as m; print(m.__file__)"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print("Could not locate battlecode26.crossplay to patch")
+        return
+    path = Path(result.stdout.strip())
+    source = path.read_text()
+    if "TCP_QUICKACK" in source:
+        return
+
+    replacements = [
+        (
+            "                self.sock.connect((IPC_HOST, IPC_PORT))\n",
+            "                self.sock.connect((IPC_HOST, IPC_PORT))\n"
+            "                self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)\n",
+        ),
+        (
+            "            self.sock.sendall(struct.pack(\">I\", length))\n"
+            "            self.sock.sendall(json_bytes)\n",
+            "            self.sock.sendall(struct.pack(\">I\", length) + json_bytes)\n",
+        ),
+        (
+            "            packet = self.sock.recv(n - len(data))\n",
+            "            packet = self.sock.recv(n - len(data))\n"
+            "            if hasattr(socket, \"TCP_QUICKACK\"):\n"
+            "                self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)\n",
+        ),
+    ]
+    for old, new in replacements:
+        if old not in source:
+            print("Engine socket code changed; skipping crossplay latency patch")
+            return
+        source = source.replace(old, new, 1)
+    path.write_text(source)
+    print("Patched crossplay socket latency")
+
+
 def install_engine(ver_data, version):
     try:
         subprocess.check_call([sys.executable, "-m", "pip", "install", f".temp/{ver_data['get_filename'](version)}"])
+        patch_crossplay_latency()
         return True
     except Exception as e:
         print(f"Failed to install package: {e}")
@@ -202,6 +249,7 @@ def install_current_version(ver_data, args):
     
     if local_version == local_version_target and not args.force_reinstall:
         print(f"Current version {local_version} is already installed.")
+        patch_crossplay_latency()
         return True
 
     print(f"updating {local_version} to {local_version_target}...")

@@ -1,4 +1,3 @@
-
 from battlecode26 import *
 from random import randint, seed
 
@@ -17,6 +16,7 @@ directions = [
     Direction.NORTHWEST,
 ]
 
+
 def turn():
     global turn_count
     turn_count += 1
@@ -28,12 +28,24 @@ def turn():
     try:
         if turn_count % 100 == 0:
             log("Turn " + str(turn_count) + ": I am a " + str(rc.get_type()))
-        
+
         if rc.can_move_forward():
-            log("Turn " + str(turn_count) + ": Trying to move " + str(rc.get_direction()))
+            log(
+                "Turn "
+                + str(turn_count)
+                + ": Trying to move "
+                + str(rc.get_direction())
+            )
             rc.move_forward()
         else:
-            log("Couldn't move forward on turn " + str(turn_count) + " at location " + str(rc.get_location()) + ", " + str(rc.get_direction()))
+            log(
+                "Couldn't move forward on turn "
+                + str(turn_count)
+                + " at location "
+                + str(rc.get_location())
+                + ", "
+                + str(rc.get_direction())
+            )
             random_direction = randint(0, 7)
 
             if rc.can_turn():

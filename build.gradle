@@ -67,6 +67,11 @@ ext.versions = [
 ]
 
 ext.python = System.properties['os.name'].toLowerCase().contains('windows') ? 'python' : 'python3'
+// Prefer the project's Python 3.12 virtualenv if it exists
+def venvPython = new File(projectDir, System.properties['os.name'].toLowerCase().contains('windows') ? '.venv/Scripts/python.exe' : '.venv/bin/python')
+if (venvPython.exists()) {
+  ext.python = venvPython.absolutePath
+}
 ext.pythonScript = new File(projectDir, "run.py")
 ext.botDirectory = new File(projectDir, "src")
 
@@ -331,23 +336,26 @@ task runJavaLocal(type: JavaExec) {
 
 task runJava(dependsOn: runJavaLocal) {}
 
-task runPyLocal(type: Exec, dependsOn: installPyLocal) {
-  commandLine python, '-m', 'battlecode26',
+// Starts the Python runner in the background so Gradle can go on to start the Java engine,
+// which the runner connects to. (Exec + --new-process deadlocks: Gradle waits for the
+// detached runner's output pipe to close, and the runner waits for the engine.)
+def startPyRunner() {
+  def cmd = [python, '-m', 'battlecode26',
     '--teamA', project.findProperty('languageA') == 'python' ? project.property('teamA') : '/',
     '--teamB', project.findProperty('languageB') == 'python' ? project.property('teamB') : '/',
     '--dirA', botDirectory.absolutePath,
-    '--dirB', botDirectory.absolutePath,
-    '--new-process'
+    '--dirB', botDirectory.absolutePath]
+  def proc = new ProcessBuilder(cmd.collect { it.toString() }).redirectErrorStream(true).start()
+  Thread.start { proc.inputStream.eachLine { println it } }
 }
 
-task runPy(type: Exec) {
+task runPyLocal(dependsOn: installPyLocal) {
+  doLast { startPyRunner() }
+}
+
+task runPy {
   mustRunAfter downloadPyPackage
-  commandLine python, '-m', 'battlecode26',
-    '--teamA', project.findProperty('languageA') == 'python' ? project.property('teamA') : '/',
-    '--teamB', project.findProperty('languageB') == 'python' ? project.property('teamB') : '/',
-    '--dirA', botDirectory.absolutePath,
-    '--dirB', botDirectory.absolutePath,
-    '--new-process'
+  doLast { startPyRunner() }
 }
 
 task runLocal {
