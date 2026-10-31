@@ -14,6 +14,13 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Build and run gradle tasks before launching the client
+echo "Running Gradle build..."
+./gradlew build
+
+echo "Running Gradle run..."
+./gradlew run
+
 appimages=(client/*.AppImage)
 appimage="${appimages[0]}"
 if [ ! -f "$appimage" ]; then
@@ -29,10 +36,10 @@ source_id="$(stat -c '%s %Y' "$appimage")"
 if [ ! -f "$stamp" ] || [ "$(cat "$stamp")" != "$source_id" ]; then
   echo "Extracting client..."
   rm -rf "$dir" client/squashfs-root
-  (cd client && "./$(basename "$appimage")" --appimage-extract > /dev/null)
+  (cd client && "./$(basename "$appimage")" --appimage-extract >/dev/null)
   mv client/squashfs-root "$dir"
   rm -f "$dir"/usr/lib/libwayland-*.so*
-  echo "$source_id" > "$stamp"
+  echo "$source_id" >"$stamp"
 fi
 
 # Avoids another common cause of blank WebKitGTK windows (DMA-BUF renderer on WSL/NVIDIA)
