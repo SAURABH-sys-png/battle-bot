@@ -1,2482 +1,1010 @@
 # BATTLECODE 2026
-# Python Player API Reference
+# Python Player API Reference (verified against the engine)
 
-**Package:** `battlecode26`  
-**Version:** `1.2.2`  
-**Python version:** `3.12`  
-**Reference source:** `wrappers.py` and `classes.py`
+| Item | Value |
+|---|---|
+| Python package | `battlecode26` **1.2.2** (`.venv/lib/python3.12/site-packages/battlecode26`) |
+| Game engine | `battlecode26-java` **1.2.6** (see `engine_version.txt`) |
+| Python version | 3.12 |
+| Sources checked | Python: `wrappers.py`, `classes.py`, `crossplay.py`, `runner.py`. Engine: `RobotController.java`, `RobotControllerImpl.java`, `InternalRobot.java`, `GameWorld.java`, `GameConstants.java`, `UnitType.java`, `TrapType.java`, `MapLocation.java`, `CrossPlay.java` (from `~/.gradle/caches/.../battlecode26-java-1.2.6-sources.jar`) |
+
+> **How to read this document.** The Python package is only a thin bridge: every
+> `rc.*` call is sent to the Java engine, and the engine decides what happens.
+> Whenever the Python package and the engine disagree, **the engine is what
+> actually runs**, and this document gives the engine's behavior. Section 3
+> lists every disagreement that was found.
 
 ---
 
-# 1. Introduction
+# 0. Quick Answers
 
-This document explains the Python API available to a Battlecode 2026 player.
-
-The API provides access to the game engine through a Python wrapper. Your bot uses these methods to:
-
-- Read the current game state.
-- Identify its team, unit type, location, and health.
-- Move around the map.
-- Sense nearby robots and map information.
-- Attack other robots.
-- Build and carry rats.
-- Collect and transfer cheese.
-- Place and remove dirt.
-- Place and remove traps.
-- Communicate with other robots.
-- Display debugging information.
-
-The Python API communicates with the underlying game engine through wrapper methods. These methods send requests using identifiers from `CrossPlayMethod` and receive responses through `send_wait_and_parse`.
-
-## 1.1 Important Architecture
-
-The supplied `wrappers.py` defines a class called:
+## 0.1 How do I get the current bot's location?
 
 ```python
-RobotController
+def turn():
+    me = rc.get_location()          # -> MapLocation
+    x, y = me.x, me.y
+    log("I am at", me)              # prints e.g. "I am at [12, 7]"
 ```
 
-Its methods are static methods.
+- **Returns:** a `MapLocation` (fields `x`, `y`). Valid coordinates are `0 <= x < rc.get_map_width()` and `0 <= y < rc.get_map_height()`. `(0, 0)` is the bottom-left corner and `NORTH` is `+y`.
+- **Which tile is returned:**
+  - `BABY_RAT` (1x1): the tile it stands on.
+  - `RAT_KING` (3x3): the **center** tile of its 3x3 body.
+  - `CAT` (2x2): the **bottom-left** tile of its 2x2 body.
+- **All tiles of your body:** `rc.get_all_part_locations()` returns a `list[MapLocation]` (1 tile for a baby rat, 9 for a rat king, 4 for a cat).
+- **Only call it inside `turn()`** (or code called from `turn()`). Calling any `rc.*` method at the top level of a file, while the bot is being loaded, raises `GameActionException(CANT_DO_THAT)`. See section 1.4.
+- Another robot's location: `rc.sense_nearby_robots()` gives `RobotInfo` objects, and each one has a `.location`.
 
-The file also defines:
+## 0.2 How much can I store in the shared array?
+
+| Property | Value (engine) |
+|---|---|
+| Number of slots | **64** (`GameConstants.SHARED_ARRAY_SIZE`), indices `0` to `63` |
+| Value range per slot | **0 to 1023** (`COMM_ARRAY_MAX_VALUE`), which is 10 bits |
+| Total capacity | 64 × 10 bits = **640 bits** (80 bytes) |
+| Initial value | every slot starts at `0` |
+| Lifetime | never reset; values persist for the whole match |
+| Scope | **one array per team**. Your team cannot read the enemy's array, and they cannot read yours |
+| Who can write | **only `RAT_KING`s**. A baby rat calling `write_shared_array` raises `GameActionException(CANT_DO_THAT)` |
+| Who can read | every robot on the team (baby rats and rat kings) |
+| Cost | no cooldown and no cheese cost |
+| Visibility of a write | immediate: robots that act after the write in the same round already see the new value |
+
+Rules that are easy to get wrong:
+- `write_shared_array(index, value)` raises `CANT_DO_THAT` if `index` is not in 0..63 **or** `value` is not in 0..1023. Negative numbers are rejected, so pack data into unsigned 10-bit fields.
+- `read_shared_array(index)` is **not bounds-checked** by the engine. An out-of-range index causes a Java `ArrayIndexOutOfBoundsException` on the engine side, not a clean `GameActionException`. Always keep the index in 0..63.
+- **A full map location does not fit in one slot.** x and y each go up to 59, which needs 6 bits each (12 bits in total), but a slot holds only 10. Either use two slots (one for `x`, one for `y`; see 17.4), or store a coarse location in one slot: `(x // 2) * 32 + (y // 2)` is at most 29·32+29 = 957, which fits.
+
+---
+
+# 1. Architecture and Sandbox Rules
+
+## 1.1 `rc` is a class with static methods
+
+`wrappers.py` defines `class RobotController` with only `@staticmethod`s, plus the alias `rc = RobotController`. Never create an instance; just call `rc.get_location()`.
+
+Each call sends a JSON request over a socket to the Java engine (`send_wait_and_parse`) and waits for the reply. Returned engine objects are turned into the Python classes in `classes.py`.
+
+## 1.2 What a bot file looks like
 
 ```python
-rc = RobotController
+from battlecode26 import *     # gives rc, Direction, MapLocation, Team, UnitType, ...
+
+def turn():                    # REQUIRED. Called once per round for each of your robots.
+    if rc.get_type().is_baby_rat_type():
+        ...
 ```
 
-This means you can use the shorter `rc` name to call the API.
+A bot **must** define `turn()`, otherwise `SyntaxError("Couldn't find turn() function.")` is raised.
 
-For example:
+## 1.3 Each robot has its own private Python globals
+
+Every robot runs in its own `RobotRunner` with its **own globals dictionary**. A module-level variable in `bot.py` is private to that one robot. It persists across that robot's turns, but it is **not** shared with your other robots. Use the shared array (rat kings write) or squeaks to communicate.
+
+Tip: keep per-robot state in a mutable container (for example `state = {"target": None}` and then `state["target"] = loc`). Mutating it needs no `global` statement.
+
+## 1.4 What is allowed while the file is loading (top-level code)
+
+While your module is imported (before the first `turn()`), the engine accepts only these calls:
+`log`, `distance_squared_to`, `bottom_left_distance_squared_to`, `direction_to`, `is_adjacent_to`, `is_within_distance_squared`, `get_all_type_locations`.
+
+Any `rc.*` call at the top level raises `GameActionException(CANT_DO_THAT, "... can only be called in the turn() function.")`.
+
+## 1.5 Imports
+
+Only these modules can be imported: `random`, `math`, `enum`, `battlecode26`, and **your own files in the same package** (for example `import path_finding`). Relative imports (`from . import x`) are not supported. Every `import` statement re-executes the imported file, so import at the top of the file only, not inside `turn()`. Circular imports raise `ImportError`.
+
+## 1.6 Builtins that are NOT available in the sandbox
+
+The sandbox only provides RestrictedPython's `safe_builtins` + `limited_builtins` plus `range`, `enumerate`, `set`, `frozenset`, `sorted`, `open`.
+
+| Available | `abs`, `bool`, `bytes`, `callable`, `chr`, `complex`, `divmod`, `enumerate`, `float`, `frozenset`, `hash`, `hex`, `id`, `int`, `isinstance`, `issubclass`, `len`, `list`, `oct`, `ord`, `pow`, `range`, `repr`, `round`, `set`, `setattr`, `delattr`, `slice`, `sorted`, `str`, `tuple`, `zip` |
+|---|---|
+| **NOT available** | **`min`, `max`, `sum`, `any`, `all`, `map`, `filter`, `reversed`, `dict()`, `print`** |
+
+Using a missing builtin raises `NameError`. Workarounds: write your own `if a < b` comparisons, use `log()` instead of `print`, and use `{}` dict literals instead of `dict()` (literals are syntax, not a builtin).
+
+## 1.7 Bytecode limits
+
+Your Python code is instrumented, and each Python bytecode instruction costs 1 unit. `rc.*` calls have no extra charge beyond the Python instructions they run. If a robot runs out, its turn ends with `"Ran out of bytecode"`. The per-turn limits come from `UnitType.bytecode_limit`: `BABY_RAT` 17500, `RAT_KING` 20000.
+
+## 1.8 `MapLocation` cannot be used in sets or as dict keys
+
+The Python `MapLocation` defines `__eq__` but not `__hash__`, so `{loc}` or `seen[loc] = 1` raises `TypeError: unhashable type: 'MapLocation'`. Use tuples instead: `seen.add((loc.x, loc.y))`.
+
+---
+
+# 2. Coordinate System
+
+- `x` grows to the **east** (right) and `y` grows to the **north** (up).
+- `(0, 0)` is the bottom-left corner of the map.
+- Map width and height are each between 20 and 60 (`MAP_MIN_*` / `MAP_MAX_*`).
+- "Distance" is almost always **squared Euclidean distance**: `dx*dx + dy*dy`. The 8 neighbors of a tile are at distance² 1 (orthogonal) or 2 (diagonal).
+- Multi-tile robots (rat king 3x3, cat 2x2) occupy several tiles. Distances for the cat are measured from the center of its 2x2 block (see `bottom_left_distance_squared_to`).
+
+---
+
+# 3. Known Discrepancies and Bugs (read this first)
+
+## 3.1 Methods that are broken in this version
+
+| Method | Problem | What happens | What to do |
+|---|---|---|---|
+| `rc.set_indicator_dot(loc, r, g, b)` | The engine handler checks for **3** parameters, but Python sends 4 (and the handler reads 4) | Engine throws an uncaught `CrossPlayException("Invalid number of parameters ... expected 3, got 4")`. This is not a `GameActionException` and it terminates that robot's engine thread | **Do not call it.** Use `rc.set_indicator_line(loc, loc, r, g, b)` to draw a single-tile mark instead |
+| `is_within_distance_squared(...)` | Python sends 5 parameters (`loc1, loc2, dist², theta, use_bottom_left`), but the engine method it calls needs 6 (it also needs a **facing `Direction`**) | Same uncaught `CrossPlayException` | **Do not call it.** Compute `dx*dx + dy*dy <= r2` yourself |
+
+## 3.2 Return types that differ from the Python type hints
+
+| Method | Python hint | Real return value |
+|---|---|---|
+| `rc.sense_passability(loc)` | `int` | **`bool`** |
+| `rc.squeak(value)` | `None` | **always `None`** in Python. The engine returns `True`/`False` but the wrapper drops it, so you cannot tell whether the squeak was sent |
+| `bottom_left_distance_squared_to(a, b)` | `int` | **`float`** |
+| `rc.get_backstabbing_team()` | `Team` | `Team`, or **`None`** while still in cooperation mode |
+| `rc.get_carrying()` | `RobotInfo` | `RobotInfo`, or **`None`** if not carrying |
+| `rc.sense_robot_at_location(loc)` | `RobotInfo` | `RobotInfo`, or **`None`** if the tile is empty |
+| `Message.source_loc` | `MapLocation` | **a raw `dict`** like `{"type": 3, "x": 5, "y": 7}`. Read `m.source_loc["x"]`, `m.source_loc["y"]` |
+
+## 3.3 Python-side stat tables are stale
+
+`UnitType`, `TrapType` and `GameConstants` in Python are local copies of the numbers. They are **not** read from the engine. `rc.get_type()` returns the Python enum member, so `rc.get_type().health` gives the **stale** value. The engine values are what the game actually uses:
+
+| Value | Python says | **Engine (real)** |
+|---|---:|---:|
+| `UnitType.RAT_KING.health` | 500 | **600** |
+| `UnitType.CAT.health` | 10000 | **4000** |
+| `UnitType.CAT.action_cooldown` | 15 | **30** |
+| `TrapType.RAT_TRAP.build_cost` | 30 | **20** |
+| `TrapType.RAT_TRAP.stun_time` | 20 | **30** |
+| `GameConstants.BUILD_ROBOT_RADIUS_SQUARED` | 4 | **8** |
+| `GameConstants.PLACE_DIRT_CHEESE_COST` | 3 | **0** |
+| `GameConstants.THROW_DAMAGE` | 20 | **10** |
+| `GameConstants.THROW_DAMAGE_PER_TILE` | 5 | **4** |
+| `GameConstants.CAT_SCRATCH_DAMAGE` | 50 | **20** |
+| `GameConstants.CAT_POUNCE_MAX_DISTANCE_SQUARED` | 9 | **13** |
+| `GameConstants.HIT_TARGET_COOLDOWN` | 30 | **20** |
+| `GameConstants.CHEESE_SPAWN_RADIUS` | 4 | renamed `SQ_CHEESE_SPAWN_RADIUS` = 4 |
+| `CAT_TRAP_ROUNDS_AFTER_BACKSTAB` | missing | **100** |
+| `CAT_BUILD_DISTANCE_SQUARED` | missing | **4.5** |
+| `THROW_RAT_COOLDOWN` | missing | **20** |
+| `TILES_FLOWN_PER_TURN` | missing | **2** |
+
+## 3.4 Engine quirks worth knowing
+
+- `CARRY_COOLDOWN_MULTIPLIER = 1.5` is cast to `int` (giving 1) before it is used, so **carrying a rat does not increase any cooldown** in engine 1.2.6.
+- `can_move(Direction.CENTER)` returns `True` and `move(Direction.CENTER)` "succeeds": it keeps you in place but still charges movement cooldown. Never pass `CENTER` to `move`.
+- `is_adjacent_to(a, a)` is `True` (a tile counts as adjacent to itself).
+- Javadoc for `can_build_rat` says "radius sqrt(4)", but the code uses `BUILD_ROBOT_RADIUS_SQUARED = 8` measured from the king's center.
+
+---
+
+# 4. Core Types
+
+## 4.1 `Team`
+
+| Member | `ordinal()` |
+|---|---:|
+| `Team.A` | 0 |
+| `Team.B` | 1 |
+| `Team.NEUTRAL` | 2 (cats belong to this team) |
+
+| Method | Input | Output | Notes |
+|---|---|---|---|
+| `team.opponent()` | none | `Team` | A↔B. `NEUTRAL.opponent()` is `NEUTRAL` |
+| `team.ordinal()` | none | `int` | see table above |
 
 ```python
-round_number = rc.get_round_num()
-location = rc.get_location()
-health = rc.get_health()
+enemy = rc.get_team().opponent()
 ```
 
-You do not need to create a `RobotController` object.
+## 4.2 `Direction`
 
-## 1.2 Basic Example
+| Member | dx | dy | `ordinal()` |
+|---|---:|---:|---:|
+| `NORTH` | 0 | +1 | 0 |
+| `NORTHEAST` | +1 | +1 | 1 |
+| `EAST` | +1 | 0 | 2 |
+| `SOUTHEAST` | +1 | -1 | 3 |
+| `SOUTH` | 0 | -1 | 4 |
+| `SOUTHWEST` | -1 | -1 | 5 |
+| `WEST` | -1 | 0 | 6 |
+| `NORTHWEST` | -1 | +1 | 7 |
+| `CENTER` | 0 | 0 | 8 |
+
+Fields: `d.dx` (int) and `d.dy` (int).
+
+| Method | Input | Output | Notes |
+|---|---|---|---|
+| `d.opposite()` | none | `Direction` | 180° turn. `CENTER` → `CENTER` |
+| `d.rotate_left()` | none | `Direction` | 45° **counter-clockwise** (NORTH → NORTHWEST). `CENTER` → `CENTER` |
+| `d.rotate_right()` | none | `Direction` | 45° **clockwise** (NORTH → NORTHEAST). `CENTER` → `CENTER` |
+| `d.get_delta_x()` | none | `int` | same as `d.dx` |
+| `d.get_delta_y()` | none | `int` | same as `d.dy` |
+| `d.ordinal()` | none | `int` | 0..8 as above |
+| `Direction.all_directions()` | none | `list[Direction]` | all **9** members, *including* `CENTER`. Call it **on the class**: `Direction.NORTH.all_directions()` raises `TypeError` |
+| `Direction.cardinal_directions()` | none | `list[Direction]` | `[NORTH, EAST, SOUTH, WEST]`. Call it on the class |
+
+The Java `Direction.fromDelta(dx, dy)` does **not** exist in Python.
+
+## 4.3 `MapLocation`
+
+`MapLocation(x: int, y: int)`, with fields `x` and `y`. Calling `str()` gives `"[x, y]"`; `repr()` gives `"MapLocation(x, y)"`.
+
+| Method | Input | Output | Notes |
+|---|---|---|---|
+| `loc.add(dir)` | `Direction` | new `MapLocation` | `(x+dx, y+dy)`. Does not check map bounds |
+| `loc.subtract(dir)` | `Direction` | new `MapLocation` | `(x-dx, y-dy)` |
+| `loc.translate(dx, dy)` | `int, int` | new `MapLocation` | `(x+dx, y+dy)` |
+| `a == b` | `MapLocation` | `bool` | equal when x and y match. Comparing with a non-`MapLocation` gives `False` |
+
+Not available on the Python object (unlike Java): `distance_squared_to`, `direction_to`, `is_adjacent_to`, `is_within_distance_squared`. Use the **global helper functions** in section 15, or do the arithmetic yourself, which is cheaper because it needs no engine round-trip. The object is **not hashable** (section 1.8).
+
+## 4.4 `UnitType`
+
+| Attribute (Python name) | BABY_RAT | RAT_KING | CAT |
+|---|---:|---:|---:|
+| `health` (starting/max HP) | 100 | **600** (Python says 500) | **4000** (Python says 10000) |
+| `size` (side length; tiles = size²) | 1 | 3 | 2 |
+| `vision_cone_radius_squared` | 20 | 25 | 17 |
+| `vision_cone_angle` (degrees, centered on facing direction) | **90** | 360 | 180 |
+| `action_cooldown` (added per attack) | 10 | 10 | **30** (Python says 15) |
+| `movement_cooldown` (added per move) | 10 (forward) / 18 (any other direction) | 40 | 20 |
+| `bytecode_limit` | 17500 | 20000 | 17500 |
+
+> The Python attribute names are `vision_cone_radius_squared` and `vision_cone_angle`
+> (not "vision radius" / "vision angle"). Bold numbers are the engine values (section 3.3).
+
+| Method | Output | True for |
+|---|---|---|
+| `t.uses_bottom_left_location_for_distance()` | `bool` | `CAT` (even size) |
+| `t.is_robot_type()` | `bool` | all three |
+| `t.is_throwable_type()` | `bool` | `BABY_RAT` |
+| `t.is_throwing_type()` | `bool` | `BABY_RAT` |
+| `t.is_baby_rat_type()` | `bool` | `BABY_RAT` |
+| `t.is_rat_king_type()` | `bool` | `RAT_KING` |
+| `t.is_cat_type()` | `bool` | `CAT` |
+| `t.ordinal()` | `int` | BABY_RAT 0, RAT_KING 1, CAT 2 |
+
+For the tiles a unit type would occupy, use the global `get_all_type_locations(unit_type, center)` (section 15).
+
+## 4.5 `TrapType`
+
+| Attribute | RAT_TRAP | CAT_TRAP | NONE |
+|---|---:|---:|---:|
+| `build_cost` (cheese) | **20** (Python says 30) | 10 | 0 |
+| `damage` | 50 | 100 | 0 |
+| `stun_time` (victim's movement cooldown is **set** to this) | **30** (Python says 20) | 20 | 0 |
+| `action_cooldown` (added to the builder) | 15 | 10 | 0 |
+| `max_count` (active traps per team) | 25 | 10 | 0 |
+| `trigger_radius_squared` | 2 | 2 | 0 |
+
+Also `trap.ordinal()` gives RAT_TRAP 0, CAT_TRAP 1, NONE 2.
+
+- Rat traps are triggered by enemy **rats** (baby rats and rat kings). Cat traps are triggered by **cats**. Your own team never triggers your traps.
+- When an enemy triggers one of your **rat traps**, your team is marked as the backstabber (see `is_cooperation`).
+
+## 4.6 `RobotInfo` (a snapshot of a robot; it is not updated later)
+
+| Field (Python) | Type | Meaning |
+|---|---|---|
+| `id` | `int` | unique robot ID |
+| `team` | `Team` | `A`, `B`, or `NEUTRAL` (cats) |
+| `type` | `UnitType` | |
+| `health` | `int` | current HP |
+| `location` | `MapLocation` | designated center (see 0.1) |
+| `direction` | `Direction` | facing direction |
+| `chirality` | `int` | used by cats only |
+| `cheese_amount` | `int` | **raw** cheese that robot carries |
+| `carrying_robot` | `RobotInfo` or `None` | robot it is carrying |
+
+The Python field is `id` (lowercase), not `ID`. There are no getter methods; read the fields directly.
+
+## 4.7 `MapInfo` (one tile)
+
+| Field | Type | Meaning |
+|---|---|---|
+| `location` | `MapLocation` | the tile |
+| `is_passable` | `bool` | `False` if wall, dirt, **or a thrown rat is flying over it**. Standing robots do **not** make a tile impassable (check occupancy separately) |
+| `flying_robot` | `RobotInfo` or `None` | a thrown rat currently over this tile |
+| `is_wall` | `bool` | permanent wall |
+| `is_dirt` | `bool` | dirt (removable, see section 9) |
+| `cheese_amount` | `int` | cheese lying on the tile |
+| `trap` | `TrapType` | **only your own team's traps are visible**. Enemy traps always show as `TrapType.NONE` |
+| `has_cheese_mine` | `bool` | a cheese mine that periodically spawns cheese nearby |
+
+These are plain attributes, not methods: `info.is_wall`, not `info.is_wall()`.
+
+## 4.8 `Message` (a squeak)
+
+| Field | Type | Meaning |
+|---|---|---|
+| `bytes` | `int` | the 32-bit integer that was squeaked |
+| `sender_id` | `int` | ID of the sender |
+| `round` | `int` | round it was sent |
+| `source_loc` | **`dict`** | `{"type": 3, "x": ..., "y": ...}`. **Not** a `MapLocation` (wrapper bug). Convert with `MapLocation(m.source_loc["x"], m.source_loc["y"])` |
+
+`Message` is not injected as a builtin; it is available through `from battlecode26 import *`.
+
+## 4.9 `GameActionException`
+
+Raised by `rc.*` methods when an action is illegal. Fields: `e.type` (a `GameActionExceptionType`) and the message `str(e)`.
+
+```python
+try:
+    rc.move(Direction.NORTH)
+except GameActionException as e:
+    log("move failed:", e.type, e)
+```
+
+| `GameActionExceptionType` | value | Typical cause |
+|---|---:|---|
+| `INTERNAL_ERROR` | 0 | engine bug |
+| `NOT_ENOUGH_RESOURCE` | 1 | (not used by the 1.2.6 RobotController; missing cheese raises `CANT_DO_THAT`) |
+| `CANT_MOVE_THERE` | 2 | target tile occupied or impassable |
+| `IS_NOT_READY` | 3 | cooldown ≥ 10, or you are being carried/thrown |
+| `CANT_SENSE_THAT` | 4 | location off-map or outside your vision cone, or robot not visible |
+| `OUT_OF_RANGE` | 5 | target outside action range, or a move would leave the map |
+| `CANT_DO_THAT` | 6 | everything else (wrong unit type, not enough cheese, bad index, ...) |
+| `NO_ROBOT_THERE` | 7 | (not used by the 1.2.6 RobotController) |
+| `ROUND_OUT_OF_RANGE` | 8 | (not used by the 1.2.6 RobotController) |
+
+Calling the `can_*` version first is cheaper and avoids the exception.
+
+---
+
+# 5. Game-State Methods
+
+| Method | Input | Output | Details |
+|---|---|---|---|
+| `rc.get_round_num()` | none | `int` | current round; the **first round is 1** |
+| `rc.get_map_width()` | none | `int` | valid x: `0 .. width-1` |
+| `rc.get_map_height()` | none | `int` | valid y: `0 .. height-1` |
+| `rc.get_id()` | none | `int` | this robot's ID |
+| `rc.get_team()` | none | `Team` | |
+| `rc.get_type()` | none | `UnitType` | the robot's current type (changes from `BABY_RAT` to `RAT_KING` after `become_rat_king`) |
+| `rc.get_health()` | none | `int` | current HP |
+| `rc.get_location()` | none | `MapLocation` | designated center (see 0.1) |
+| `rc.get_all_part_locations()` | none | `list[MapLocation]` | **every tile this robot occupies**: 1 (baby rat), 9 (rat king), 4 (cat) |
+| `rc.get_direction()` | none | `Direction` | facing direction (it controls the vision cone) |
+| `rc.is_cooperation()` | none | `bool` | `True` while both teams are in cooperation mode; `False` after any backstab (see below) |
+| `rc.get_backstabbing_team()` | none | `Team` or `None` | the team that backstabbed first; `None` while still cooperating |
+| `rc.get_number_rat_traps()` | none | `int` | number of **your team's** active rat traps (max 25) |
+| `rc.get_number_cat_traps()` | none | `int` | number of **your team's** active cat traps (max 10) |
+
+**Backstab:** the game starts in cooperation mode. It ends permanently the first time a team bites an enemy non-cat robot, grabs an enemy rat, or has one of its rat traps triggered by an enemy. That team becomes the "backstabbing team".
+
+---
+
+# 6. Cheese and Resource Queries
+
+| Method | Input | Output | Details |
+|---|---|---|---|
+| `rc.get_raw_cheese()` | none | `int` | cheese **this robot is carrying**. Always 0 for a rat king, because a king's cheese goes straight to the team pool |
+| `rc.get_global_cheese()` | none | `int` | the **team's shared cheese pool** (starts at 2500) |
+| `rc.get_all_cheese()` | none | `int` | `raw + global`: everything this robot can spend |
+| `rc.get_dirt()` | none | `int` | the **team's** dirt stock (shared by the team, not per robot). Removing dirt adds 1; placing dirt uses 1 |
+| `rc.get_current_rat_cost()` | none | `int` | cheese a king needs to spawn the next baby rat: `10 + 10 × floor(your_baby_rat_count / 4)` |
+
+**Spending order:** when a baby rat pays for something (traps, digging, bite cheese), the cost is taken from its raw cheese first, and any remainder comes from the team pool.
+
+**Rat king upkeep:** each king eats `RAT_KING_CHEESE_CONSUMPTION = 2` cheese per round from the team pool. In any round where the pool has fewer than 2 cheese, the king loses `RAT_KING_HEALTH_LOSS = 10` HP instead.
+
+**Carry penalty:** a baby rat's movement **and** action cooldown costs are multiplied by `(1 + 0.01 × raw_cheese)`. Turning is not affected.
+
+---
+
+# 7. Vision and Sensing
+
+A location is **sensable** when it is on the map, within `vision_cone_radius_squared` of you, **and** within `vision_cone_angle / 2` degrees of your facing direction. A baby rat only sees a 90° cone in front of it; the king sees all around (360°). Your own tile is always sensable.
+
+| Method | Input | Output | Raises / returns False when |
+|---|---|---|---|
+| `rc.on_the_map(loc)` | `MapLocation` | `bool` | never raises. Checks only map bounds |
+| `rc.can_sense_location(loc)` | `MapLocation` | `bool` | `False` if off-map or outside the vision cone |
+| `rc.is_location_occupied(loc)` | `MapLocation` | `bool` (robot there?) | raises `CANT_SENSE_THAT` if the tile is not sensable |
+| `rc.can_sense_robot_at_location(loc)` | `MapLocation` | `bool` | `True` only if sensable **and** a robot is there. Never raises |
+| `rc.sense_robot_at_location(loc)` | `MapLocation` | `RobotInfo` or `None` | raises `CANT_SENSE_THAT` if not sensable; `None` if empty. For a multi-tile robot, any of its tiles returns it |
+| `rc.can_sense_robot(id)` | `int` | `bool` | `False` if the robot does not exist, **is currently being thrown**, or its location is not sensable |
+| `rc.sense_robot(id)` | `int` | `RobotInfo` | raises `CANT_SENSE_THAT` whenever `can_sense_robot(id)` is `False` |
+| `rc.sense_passability(loc)` | `MapLocation` | **`bool`** | `True` = no wall, no dirt, no flying rat. Raises `CANT_SENSE_THAT` if not sensable |
+| `rc.sense_map_info(loc)` | `MapLocation` | `MapInfo` | raises `CANT_SENSE_THAT` if not sensable |
+| `rc.adjacent_location(dir)` | `Direction` | `MapLocation` | `get_location().add(dir)`. Never raises and does **not** check the map |
+| `rc.get_all_locations_within_radius_squared(center, r2)` | `MapLocation, int` | `list[MapLocation]` | only tiles within `r2` of `center` **that you can currently sense**. `r2` is capped at your vision radius; `-1` means your vision radius; `r2 < -1` raises `CANT_DO_THAT` |
+
+## 7.1 `rc.sense_nearby_robots(...)` → `list[RobotInfo]`
+
+Returns visible robots (never yourself), in no particular order. A multi-tile robot is included if **any** of its tiles is visible and within the radius. Each robot appears once.
+
+| Python call form (the ONLY valid ones) | Meaning |
+|---|---|
+| `rc.sense_nearby_robots()` | everything you can see |
+| `rc.sense_nearby_robots(radius_squared=r2)` | within `r2` of you |
+| `rc.sense_nearby_robots(radius_squared=r2, team=t)` | within `r2` of you, only team `t` |
+| `rc.sense_nearby_robots(center=c, radius_squared=r2, team=t)` | within `r2` of `c`, only team `t` |
+
+- Any other combination, for example `sense_nearby_robots(team=t)` or `sense_nearby_robots(center=c)`, raises Python `ValueError`. To filter only by team, pass `radius_squared=-1`: `rc.sense_nearby_robots(radius_squared=-1, team=enemy)`.
+- `r2 = -1` means your vision radius. Larger values are capped at your vision radius. `r2 < -1` raises `GameActionException(CANT_DO_THAT)`.
+- Even with a custom `center`, robots must still be inside **your** vision cone.
+- Cats are on `Team.NEUTRAL`.
+
+```python
+enemies = rc.sense_nearby_robots(radius_squared=-1, team=rc.get_team().opponent())
+cats    = rc.sense_nearby_robots(radius_squared=-1, team=Team.NEUTRAL)
+```
+
+## 7.2 `rc.sense_nearby_map_infos(...)` → `list[MapInfo]`
+
+| Python call form | Meaning |
+|---|---|
+| `rc.sense_nearby_map_infos()` | all sensable tiles |
+| `rc.sense_nearby_map_infos(center=c)` | sensable tiles within vision radius of `c` |
+| `rc.sense_nearby_map_infos(radius_squared=r2)` | sensable tiles within `r2` of you |
+| `rc.sense_nearby_map_infos(center=c, radius_squared=r2)` | sensable tiles within `r2` of `c` |
+
+The same radius rules apply (`-1` means vision; capped at vision; `< -1` raises `CANT_DO_THAT`). Only tiles you can sense are returned.
+
+---
+
+# 8. Cooldowns, Movement and Turning
+
+## 8.1 How cooldowns work
+
+Each robot has three independent counters: **action**, **movement** and **turning**.
+- A counter is **ready** when it is `< 10` (`COOLDOWN_LIMIT`), and the robot is not being carried or thrown.
+- Every round each counter goes down by 10 (`COOLDOWNS_PER_TURN`), but not below 0.
+- Doing something **adds** its cost to the counter.
+- Because the counters are independent, you can **turn, move and act in the same turn**.
+
+| Method | Input | Output | Details |
+|---|---|---|---|
+| `rc.is_action_ready()` | none | `bool` | action cooldown < 10 and not carried/thrown |
+| `rc.is_movement_ready()` | none | `bool` | movement cooldown < 10 and not carried/thrown |
+| `rc.is_turning_ready()` | none | `bool` | turning cooldown < 10 and not carried/thrown |
+| `rc.get_action_cooldown_turns()` | none | `int` | raw counter value |
+| `rc.get_movement_cooldown_turns()` | none | `int` | raw counter value |
+| `rc.get_turning_cooldown_turns()` | none | `int` | raw counter value |
+
+## 8.2 Movement
+
+| Method | Input | Output | Details |
+|---|---|---|---|
+| `rc.can_move(dir)` | `Direction` | `bool` | `True` if movement is ready **and** every tile of your body shifted by `dir` is on the map, not occupied by another robot, and passable |
+| `rc.move(dir)` | `Direction` | `None` | moves one tile. Raises `IS_NOT_READY` (cooldown or carried), `OUT_OF_RANGE` (off map) or `CANT_MOVE_THERE` (occupied or impassable) |
+| `rc.can_move_forward()` | none | `bool` | `can_move(rc.get_direction())` |
+| `rc.move_forward()` | none | `None` | `move(rc.get_direction())` |
+
+**Movement cost (added to the movement cooldown):**
+
+| Unit | Cost |
+|---|---|
+| `BABY_RAT` moving in the direction it **faces** | 10 |
+| `BABY_RAT` moving in **any other** direction (strafing) | 18 (`MOVE_STRAFE_COOLDOWN`) |
+| `RAT_KING` (any direction) | 40 |
+| `CAT` (any direction) | 20 |
+
+The baby rat cost is then multiplied by `(1 + 0.01 × raw cheese)`.
+
+- **Moving does not change your facing direction.** To move cheaply *and* look where you are going, a baby rat should `turn(d)` and then `move(d)` in the same turn. That costs 10 movement + 10 turning, so it can do it every turn, while strafing every turn costs 18 and leaves it slower.
+- A rat king checks all 9 tiles of its body, so it needs a clear 3-wide path.
+- Entering a tile next to an enemy trap (within its trigger radius) triggers it.
+- Cats are allowed to move onto baby rats, which crushes them.
+
+## 8.3 Turning
+
+| Method | Input | Output | Details |
+|---|---|---|---|
+| `rc.can_turn()` | none | `bool` | turning cooldown < 10 and not carried/thrown |
+| `rc.can_turn(dir)` | `Direction` | `bool` | the same, plus `dir` must not be `CENTER` |
+| `rc.turn(dir)` | `Direction` | `None` | sets the facing to `dir` (any of the 8 directions, in a single call). Adds 10 to the turning cooldown. Raises `IS_NOT_READY` or `CANT_DO_THAT` (for `CENTER`) |
+
+---
+
+# 9. Building, Dirt and Traps
+
+**Build range** (for dirt and traps), measured from your `get_location()`:
+baby rat: distance² ≤ **2** (the 8 neighbors and your own tile); rat king: ≤ **8** from its center (the ring of tiles touching its 3x3 body); cat: ≤ 4.5 from its 2x2 center. The target must also be **sensable**: a baby rat has to *face* the tile it builds on.
+
+## 9.1 Spawning baby rats (rat king only)
+
+| Method | Input | Output |
+|---|---|---|
+| `rc.can_build_rat(loc)` | `MapLocation` | `bool` |
+| `rc.build_rat(loc)` | `MapLocation` | `None` (raises `GameActionException` if illegal) |
+
+Requirements:
+1. You are a `RAT_KING`.
+2. Action is ready.
+3. `loc` is sensable and within distance² **8** of the king's center (the 16-tile ring around the 3x3 body).
+4. The team pool has at least `get_current_rat_cost()` cheese.
+5. `loc` is unoccupied and passable.
+
+Effect: the cost is paid from the team pool, action cooldown increases by **10**, and the new baby rat faces the same direction as the king.
+
+## 9.2 Becoming a rat king (baby rat only)
+
+| Method | Input | Output |
+|---|---|---|
+| `rc.can_become_rat_king()` | none | `bool` |
+| `rc.become_rat_king()` | none | `None` |
+
+Requirements:
+1. Action is ready.
+2. The team pool has at least **50** cheese.
+3. Your team has fewer than **5** kings, and fewer than **2** after round 1200.
+4. All 9 tiles of the 3x3 square centered on you are on the map and passable.
+5. There is no cat or rat king in that 3x3 square.
+6. At least **7 allied baby rats** are in that 3x3 square, **counting yourself**.
+
+Effect:
+- **Every other robot in the 3x3 square dies**, including enemy baby rats.
+- Their carried cheese and yours goes to the team pool.
+- 50 cheese is paid.
+- Your new HP is the sum of the allied HP in the square, capped at 600.
+- Your type becomes `RAT_KING` and your location becomes the center of the 3x3.
+
+## 9.3 Dirt
+
+| Method | Input | Output | Requirements | Effect |
+|---|---|---|---|---|
+| `rc.can_place_dirt(loc)` / `rc.place_dirt(loc)` | `MapLocation` | `bool` / `None` | action ready; in build range and sensable; team dirt > 0; enough cheese for `PLACE_DIRT_CHEESE_COST` (**0** in the engine); tile is not a wall, not occupied, has no dirt, and has no cheese mine | tile becomes dirt (impassable), team dirt −1, action cooldown **+25** |
+| `rc.can_remove_dirt(loc)` / `rc.remove_dirt(loc)` | `MapLocation` | `bool` / `None` | action ready; in build range and sensable; tile has dirt; rats need ≥ **5** cheese (`get_all_cheese()`) | tile becomes passable, team dirt +1, −5 cheese, action cooldown **+25** |
+
+## 9.4 Traps
+
+| Method | Input | Output |
+|---|---|---|
+| `rc.can_place_rat_trap(loc)` / `rc.place_rat_trap(loc)` | `MapLocation` | `bool` / `None` |
+| `rc.can_place_cat_trap(loc)` / `rc.place_cat_trap(loc)` | `MapLocation` | `bool` / `None` |
+| `rc.can_remove_rat_trap(loc)` / `rc.remove_rat_trap(loc)` | `MapLocation` | `bool` / `None` |
+| `rc.can_remove_cat_trap(loc)` / `rc.remove_cat_trap(loc)` | `MapLocation` | `bool` / `None` |
+
+**Placing a trap requires:**
+1. Action is ready.
+2. `loc` is in build range and sensable.
+3. The tile is passable and unoccupied.
+4. Your team has no trap on that tile yet.
+5. The team has fewer than `max_count` traps of that type (rat 25, cat 10).
+6. `get_all_cheese()` ≥ `build_cost` (rat **20**, cat 10).
+7. The tile has no cheese mine.
+8. For **cat traps only**: the game must still be in cooperation mode, or your team must have been backstabbed (not be the backstabber) within the last **100** rounds.
+
+Effect: the cost is paid, and action cooldown increases by `trap.action_cooldown` (rat 15, cat 10).
+
+**Removing a trap** requires only that it is your own trap and the tile is in build range and sensable. It needs **no action readiness, no cooldown and no cost**.
+
+**When a trap triggers**, the victim takes `damage` and its movement cooldown is set to `stun_time`.
+
+---
+
+# 10. Combat and Carrying
+
+## 10.1 Attacking (biting)
+
+| Method | Input | Output |
+|---|---|---|
+| `rc.can_attack(loc, cheese_amount=0)` | `MapLocation, int` | `bool` |
+| `rc.attack(loc, cheese_amount=0)` | `MapLocation, int` | `None` |
+
+Requirements for a baby rat or rat king:
+1. Action is ready.
+2. `loc` is **sensable**. A baby rat must therefore be facing the target.
+3. `0 < distance² ≤ 2` (baby rat: an adjacent tile) or `≤ 8` (king: tiles touching its body).
+4. The tile is passable.
+5. An **enemy** robot is there (bites on allies are rejected).
+6. `cheese_amount ≥ 0` and `get_all_cheese() ≥ cheese_amount`.
+
+Damage: `RAT_BITE_DAMAGE = 10`. If `cheese_amount > 0`, that cheese is spent and the bite does `10 + ceil(sqrt(cheese_amount))` damage. Action cooldown increases by the unit's `action_cooldown` (10).
+
+Biting an enemy that is not a cat ends cooperation (your team becomes the backstabber).
+
+## 10.2 Carrying, dropping and throwing (baby rats only)
+
+| Method | Input | Output | Requirements | Effect |
+|---|---|---|---|---|
+| `rc.can_carry_rat(loc)` / `rc.carry_rat(loc)` | `MapLocation` | `bool` / `None` | action ready; you are a baby rat that is not carrying and not being carried; `loc` is adjacent and sensable; the target is a baby rat that is not being thrown and is not you; you may grab it if it is an **ally**, or it **cannot see you**, or its HP < your HP; you cannot re-grab an enemy you dropped or threw less than 2 turns ago | you pick it up; action cooldown **+20**. Grabbing an enemy ends cooperation |
+| `rc.can_drop_rat(dir)` / `rc.drop_rat(dir)` | `Direction` | `bool` / `None` | action ready; carrying; the adjacent tile in `dir` is on the map, passable and empty | it is placed there safely; action cooldown **+20** |
+| `rc.can_throw_rat()` / `rc.throw_rat()` | none | `bool` / `None` | action ready; carrying; the tile **in front of you** (facing direction) is on the map, passable and empty | it is thrown in your facing direction; action cooldown **+20** |
+| `rc.get_carrying()` | none | `RobotInfo` or `None` | | |
+| `rc.is_being_carried()` | none | `bool` | | while carried you cannot act, move or turn |
+| `rc.is_being_thrown()` | none | `bool` | | while flying you cannot act, move, turn or pick up cheese |
+
+A thrown rat flies 2 tiles per turn for up to 4 turns (`TILES_FLOWN_PER_TURN`, `THROW_DURATION`). The engine constants are `THROW_DAMAGE = 10`, `THROW_DAMAGE_PER_TILE = 4`, `HIT_GROUND_COOLDOWN = 10` and `HIT_TARGET_COOLDOWN = 20`.
+
+---
+
+# 11. Cheese Actions
+
+| Method | Input | Output | Requirements | Effect |
+|---|---|---|---|---|
+| `rc.can_pick_up_cheese(loc)` | `MapLocation` | `bool` | you are a baby rat or rat king; `loc` is sensable and within distance² **2** (a king measures from its center, so it can only pick up cheese lying under its own 3x3 body); the tile has > 0 cheese; you are not being thrown | |
+| `rc.pick_up_cheese(loc)` | `MapLocation` | `None` | same | takes **all** the cheese on the tile |
+| `rc.pick_up_cheese(loc, amount)` | `MapLocation, int` | `None` | same | takes `amount`, clamped to 0..available |
+| `rc.can_transfer_cheese(loc, amount)` | `MapLocation, int` | `bool` | you are a **baby rat**; action ready; at `loc` (any tile of the king's body) is an **allied rat king**; within distance² **9** and sensable; `0 < amount ≤ get_raw_cheese()` | |
+| `rc.transfer_cheese(loc, amount)` | `MapLocation, int` | `None` | same | raw cheese → team pool; action cooldown **+10** |
+
+- Picking up cheese needs **no action readiness and adds no cooldown**.
+- Cheese a baby rat picks up becomes its raw cheese, which slows it down (section 6).
+- Cheese a king picks up goes **directly into the team pool**.
+- A baby rat's raw cheese only joins the team pool when it is transferred to a king. Until then, only that rat can spend it.
+
+---
+
+# 12. Communication
+
+## 12.1 Shared array
+
+See section **0.2** for all the rules.
+
+| Method | Input | Output | Raises |
+|---|---|---|---|
+| `rc.read_shared_array(index)` | `int` (0..63) | `int` (0..1023) | nothing for valid indices. An invalid index crashes on the engine side (not bounds-checked) |
+| `rc.write_shared_array(index, value)` | `int` (0..63), `int` (0..1023) | `None` | `CANT_DO_THAT` if you are not a rat king, or the index or value is out of range |
+
+## 12.2 Squeaks (short-range messages)
+
+| Method | Input | Output | Details |
+|---|---|---|---|
+| `rc.squeak(value)` | `int` (32-bit) | `None` | broadcasts `value` to every robot whose tile is within distance² **16** of your location. **Recipients are your allies AND cats**; enemy rats do not hear it. No vision or line of sight is needed. At most **1 squeak per turn**; extra calls are silently ignored (the wrapper hides the engine's `False`) |
+| `rc.read_squeaks(round_num)` | `int` | `list[Message]` | squeaks this robot has received that were sent in round `round_num`. Pass **`-1`** to get every buffered squeak. Messages older than 5 rounds (`MESSAGE_ROUND_DURATION`) are discarded |
+
+```python
+# Send my position (x, y < 60 fit easily in 32 bits)
+me = rc.get_location()
+rc.squeak((me.x << 8) | me.y)
+
+# Read everything received in the last 5 rounds
+for m in rc.read_squeaks(-1):
+    x = (m.bytes >> 8) & 0xFF
+    y = m.bytes & 0xFF
+    src = MapLocation(m.source_loc["x"], m.source_loc["y"])   # source_loc is a dict!
+```
+
+Squeaks sent this round are available to robots that take their turn later in the same round.
+
+---
+
+# 13. Indicators (debug drawing in the client)
+
+| Method | Input | Output | Details |
+|---|---|---|---|
+| `rc.set_indicator_string(text)` | `str` | `None` | shown for this robot in the client; truncated to 256 characters |
+| `rc.set_indicator_line(start, end, r, g, b)` | `MapLocation, MapLocation, int, int, int` | `None` | draws a line; raises `CANT_DO_THAT` if either end is off the map |
+| `rc.set_timeline_marker(text, r, g, b)` | `str, int, int, int` | `None` | adds a team marker on the timeline at this round; truncated to 64 characters |
+| `rc.set_indicator_dot(loc, r, g, b)` | `MapLocation, int, int, int` | — | **BROKEN in engine 1.2.6, do not call** (section 3.1). Use `rc.set_indicator_line(loc, loc, r, g, b)` instead |
+
+---
+
+# 14. Other RobotController Methods
+
+| Method | Input | Output | Details |
+|---|---|---|---|
+| `rc.disintegrate()` | none | `None` | this robot dies immediately |
+| `rc.resign()` | none | `None` | **all** your robots are destroyed and the opponent wins |
+
+---
+
+# 15. Global Helper Functions
+
+These are plain functions (not `rc.` methods). They are available after `from battlecode26 import *` and are allowed at module load time. Each one is an engine round-trip, so in hot loops plain arithmetic is cheaper.
+
+| Function | Input | Output | Details |
+|---|---|---|---|
+| `log(*messages)` | anything | `None` | `" ".join(str(m) for m in messages)` goes to the match log. Use this instead of `print` (not available) |
+| `distance_squared_to(a, b)` | `MapLocation, MapLocation` | `int` | `(a.x-b.x)² + (a.y-b.y)²` |
+| `bottom_left_distance_squared_to(a, b)` | `MapLocation, MapLocation` | **`float`** | `(a.x+0.5-b.x)² + (a.y+0.5-b.y)²` (the distance from the center of a 2x2 block whose bottom-left tile is `a`) |
+| `direction_to(a, b)` | `MapLocation, MapLocation` | `Direction` | the closest of the 8 directions from `a` toward `b`; `CENTER` if `a == b`. Rule: if `|dx| ≥ 2.414·|dy|`, it is EAST or WEST; if `|dy| ≥ 2.414·|dx|`, it is NORTH or SOUTH; otherwise it is the diagonal |
+| `is_adjacent_to(a, b)` | `MapLocation, MapLocation` | `bool` | `|dx| ≤ 1 and |dy| ≤ 1`. **Also `True` when `a == b`** |
+| `is_within_distance_squared(a, b, d2, theta=360, use_bottom_left=False)` | | | **BROKEN, do not call** (section 3.1) |
+| `get_all_type_locations(unit_type, center)` | `UnitType, MapLocation` | `list[MapLocation]` | the size² tiles a unit of that type would occupy if its designated location were `center` |
+
+---
+
+# 16. GameConstants (engine 1.2.6 values)
+
+`GameConstants` in Python is only a reference copy; changing it does nothing, and several values are stale (section 3.3). The **engine** values are listed here.
+
+| Group | Constant | Value |
+|---|---|---:|
+| Game | `GAME_MAX_NUMBER_OF_ROUNDS` | 2000 |
+| | `GAME_DEFAULT_SEED` | 6370 |
+| | `EXCEPTION_BYTECODE_PENALTY` | 500 |
+| | `MAX_TEAM_EXECUTION_TIME` (ns) | 1200000000000 |
+| Map | `MAP_MIN_WIDTH` / `MAP_MAX_WIDTH` | 20 / 60 |
+| | `MAP_MIN_HEIGHT` / `MAP_MAX_HEIGHT` | 20 / 60 |
+| | `MAX_DIRT_PERCENTAGE` / `MAX_WALL_PERCENTAGE` | 50 / 20 |
+| | `MIN_CHEESE_MINE_SPACING_SQUARED` | 25 |
+| Team / king | `INITIAL_TEAM_CHEESE` | 2500 |
+| | `NUMBER_INITIAL_RAT_KINGS` | 1 |
+| | `MAX_NUMBER_OF_RAT_KINGS` / `_AFTER_CUTOFF` | 5 / 2 |
+| | `RAT_KING_CUTOFF_ROUND` | 1200 |
+| | `RAT_KING_UPGRADE_CHEESE_COST` | 50 |
+| | `RAT_KING_CHEESE_CONSUMPTION` (per round) | 2 |
+| | `RAT_KING_HEALTH_LOSS` (per hungry round) | 10 |
+| Cheese | `CHEESE_COOLDOWN_PENALTY` (per raw cheese) | 0.01 |
+| | `CHEESE_MINE_SPAWN_PROBABILITY` | 0.01 |
+| | `SQ_CHEESE_SPAWN_RADIUS` | 4 |
+| | `CHEESE_SPAWN_AMOUNT` | 20 |
+| | `CHEESE_PICK_UP_RADIUS_SQUARED` | 2 |
+| | `CHEESE_TRANSFER_RADIUS_SQUARED` | 9 |
+| Building | `BUILD_ROBOT_RADIUS_SQUARED` | **8** |
+| | `BUILD_ROBOT_BASE_COST` / `BUILD_ROBOT_COST_INCREASE` / `NUM_ROBOTS_FOR_COST_INCREASE` | 10 / 10 / 4 |
+| | `BUILD_DISTANCE_SQUARED` (rat) / `RAT_KING_BUILD_DISTANCE_SQUARED` / `CAT_BUILD_DISTANCE_SQUARED` | 2 / 8 / 4.5 |
+| | `BUILD_ROBOT_COOLDOWN` | 10 |
+| Dirt | `DIG_DIRT_CHEESE_COST` / `PLACE_DIRT_CHEESE_COST` | 5 / **0** |
+| | `DIG_COOLDOWN` (place or remove) | 25 |
+| | `CAT_DIG_ADDITIONAL_COOLDOWN` | 5 |
+| Combat | `ATTACK_DISTANCE_SQUARED` / `RAT_KING_ATTACK_DISTANCE_SQUARED` | 2 / 8 |
+| | `RAT_BITE_DAMAGE` | 10 |
+| | `CAT_SCRATCH_DAMAGE` | **20** |
+| | `CAT_POUNCE_MAX_DISTANCE_SQUARED` | **13** |
+| | `HEALTH_GRAB_THRESHOLD` | 0 |
+| | `CAT_TRAP_ROUNDS_AFTER_BACKSTAB` | 100 |
+| Throwing | `THROW_DAMAGE` / `THROW_DAMAGE_PER_TILE` | **10** / **4** |
+| | `TILES_FLOWN_PER_TURN` / `THROW_DURATION` | 2 / 4 |
+| | `THROW_RAT_COOLDOWN` (carry, drop, throw) | 20 |
+| | `HIT_GROUND_COOLDOWN` / `HIT_TARGET_COOLDOWN` | 10 / **20** |
+| | `MAX_CARRY_TOWER_HEIGHT` / `MAX_CARRY_DURATION` | 2 / 10 |
+| | `SAME_ROBOT_CARRY_COOLDOWN_TURNS` | 2 |
+| | `CARRY_COOLDOWN_MULTIPLIER` | 1.5 (has no effect, section 3.4) |
+| Comms | `SHARED_ARRAY_SIZE` / `COMM_ARRAY_MAX_VALUE` | 64 / 1023 |
+| | `SQUEAK_RADIUS_SQUARED` / `MAX_MESSAGES_SENT_ROBOT` / `MESSAGE_ROUND_DURATION` | 16 / 1 / 5 |
+| Cooldowns | `COOLDOWN_LIMIT` / `COOLDOWNS_PER_TURN` | 10 / 10 |
+| | `TURNING_COOLDOWN` / `MOVE_STRAFE_COOLDOWN` | 10 / 18 |
+| | `CHEESE_TRANSFER_COOLDOWN` | 10 |
+| Debug | `INDICATOR_STRING_MAX_LENGTH` / `TIMELINE_LABEL_MAX_LENGTH` | 256 / 64 |
+| Other | `CAT_SLEEP_TIME` | 2 |
+
+---
+
+# 17. Practical Patterns
+
+## 17.1 Move from point A to point B (bug navigation)
+
+Call `move_to(target)` **once per turn**. It takes one step (if movement is ready), goes around walls, dirt, robots and map edges by following the obstacle, and returns `True` once you have arrived. It was tested offline against a mock controller that follows the engine's movement rules (an open map, a long wall, a U-shaped trap, a two-gap maze, a wall touching the map edge, and an unreachable target), and under the sandbox's restricted builtins.
 
 ```python
 from battlecode26 import *
 
-def turn():
-    current_round = rc.get_round_num()
-    current_location = rc.get_location()
-
-    log("Round:", current_round)
-    log("Location:", current_location)
-
-    if rc.can_move(Direction.NORTH):
-        rc.move(Direction.NORTH)
-```
-
-The example demonstrates:
-
-- Reading the current round.
-- Reading the robot's location.
-- Printing debugging information.
-- Checking whether movement is possible.
-- Moving the robot.
-
-**Important:** This document describes the Python-facing API found in the supplied source files. It does not attempt to define every game rule, action cost, visibility restriction, or engine-side behavior.
-
----
-
-# 2. Core API Types
-
-Before using the RobotController methods, you should understand the types used by the API.
-
-The main types are:
-
-1. `Team`
-2. `Direction`
-3. `MapLocation`
-4. `UnitType`
-5. `TrapType`
-6. `RobotInfo`
-7. `MapInfo`
-8. `Message`
-9. `GameActionException`
-10. `GameConstants`
-
----
-
-# 3. Team
-
-The `Team` enum identifies which team a robot belongs to.
-
-It contains three values:
-
-| Value | Description |
-|---|---|
-| `Team.A` | Team A |
-| `Team.B` | Team B |
-| `Team.NEUTRAL` | Neutral team |
-
-## 3.1 Methods
-
-### `opponent()`
-
-Returns the opposing team.
-
-```python
-my_team = rc.get_team()
-enemy_team = my_team.opponent()
-```
-
-### `ordinal()`
-
-Returns the numerical enum value.
-
-The supplied source defines:
-
-| Team | Ordinal |
-|---|---:|
-| A | 0 |
-| B | 1 |
-| NEUTRAL | 2 |
-
-## 3.2 Example
-
-```python
-team = rc.get_team()
-
-if team == Team.A:
-    log("I belong to Team A")
-
-elif team == Team.B:
-    log("I belong to Team B")
-```
-
----
-
-# 4. Direction
-
-`Direction` represents the eight compass directions and the center direction.
-
-It is one of the most frequently used types in Battlecode.
-
-## 4.1 Direction Values
-
-| Direction | dx | dy |
-|---|---:|---:|
-| NORTH | 0 | 1 |
-| NORTHEAST | 1 | 1 |
-| EAST | 1 | 0 |
-| SOUTHEAST | 1 | -1 |
-| SOUTH | 0 | -1 |
-| SOUTHWEST | -1 | -1 |
-| WEST | -1 | 0 |
-| NORTHWEST | -1 | 1 |
-| CENTER | 0 | 0 |
-
-The `dx` and `dy` fields represent the direction's coordinate changes.
-
-For example:
-
-```python
-Direction.NORTH.dx
-```
-
-returns `0`, while:
-
-```python
-Direction.NORTH.dy
-```
-
-returns `1`.
-
-## 4.2 Direction Methods
-
-### `opposite()`
-
-Returns the opposite direction.
-
-```python
-direction = Direction.NORTH
-opposite = direction.opposite()
-```
-
-Result:
-
-```python
-Direction.SOUTH
-```
-
-### `rotate_left()`
-
-Rotates the direction to the left.
-
-```python
-direction = Direction.NORTH
-new_direction = direction.rotate_left()
-```
-
-### `rotate_right()`
-
-Rotates the direction to the right.
-
-```python
-direction = Direction.NORTH
-new_direction = direction.rotate_right()
-```
-
-### `all_directions()`
-
-Returns all direction enum members, including `CENTER`.
-
-### `cardinal_directions()`
-
-Returns the four cardinal directions:
-
-- NORTH
-- EAST
-- SOUTH
-- WEST
-
-### `get_delta_x()`
-
-Returns the horizontal coordinate change.
-
-### `get_delta_y()`
-
-Returns the vertical coordinate change.
-
-### `ordinal()`
-
-Returns the numerical enum value.
-
-## 4.3 Example
-
-```python
-direction = Direction.EAST
-
-x_change = direction.get_delta_x()
-y_change = direction.get_delta_y()
-
-log(x_change, y_change)
-```
-
-Expected output:
-
-```text
-1 0
-```
-
----
-
-# 5. MapLocation
-
-`MapLocation` represents a coordinate on the game map.
-
-It contains two fields:
-
-```python
-x
-y
-```
-
-For example:
-
-```python
-location = MapLocation(5, 10)
-```
-
-This represents the coordinate `(5, 10)`.
-
-## 5.1 Fields
-
-| Field | Description |
-|---|---|
-| `x` | Horizontal coordinate |
-| `y` | Vertical coordinate |
-
-## 5.2 Methods
-
-### `add(dir)`
-
-Adds a direction to the current location.
-
-```python
-location = MapLocation(5, 10)
-
-new_location = location.add(Direction.NORTH)
-```
-
-Result:
-
-```python
-MapLocation(5, 11)
-```
-
-### `subtract(dir)`
-
-Subtracts a direction from the current location.
-
-```python
-location = MapLocation(5, 10)
-
-new_location = location.subtract(Direction.NORTH)
-```
-
-### `translate(dx, dy)`
-
-Moves a location by specified coordinate changes.
-
-```python
-location = MapLocation(5, 10)
-
-new_location = location.translate(2, 3)
-```
-
-Result:
-
-```python
-MapLocation(7, 13)
-```
-
-## 5.3 Equality
-
-The supplied implementation compares locations using their `x` and `y` values.
-
-Example:
-
-```python
-a = MapLocation(5, 10)
-b = MapLocation(5, 10)
-
-if a == b:
-    log("Same location")
-```
-
----
-
-# 6. UnitType
-
-`UnitType` describes the different robot types in the game.
-
-The supplied 2026 API defines three types:
-
-- `BABY_RAT`
-- `RAT_KING`
-- `CAT`
-
-## 6.1 UnitType Attributes
-
-| Attribute | BABY_RAT | RAT_KING | CAT |
-|---|---:|---:|---:|
-| Health | 100 | 500 | 10000 |
-| Size | 1 | 3 | 2 |
-| Vision radius squared | 20 | 25 | 17 |
-| Vision angle | 90 | 360 | 180 |
-| Action cooldown | 10 | 10 | 15 |
-| Movement cooldown | 10 | 40 | 20 |
-| Bytecode limit | 17500 | 20000 | 17500 |
-
-These values are exposed as attributes of the unit type.
-
-Example:
-
-```python
-unit_type = rc.get_type()
-
-log(unit_type.health)
-log(unit_type.size)
-```
-
-## 6.2 UnitType Methods
-
-### `uses_bottom_left_location_for_distance()`
-
-Returns whether the unit type uses the bottom-left location convention for distance calculations.
-
-The supplied source indicates that this is true for `CAT`.
-
-### `is_robot_type()`
-
-Checks whether the unit is a robot type.
-
-### `is_throwable_type()`
-
-Checks whether the type can be thrown.
-
-### `is_throwing_type()`
-
-Checks whether the type is a throwing type.
-
-### `is_baby_rat_type()`
-
-Checks whether the type is `BABY_RAT`.
-
-### `is_rat_king_type()`
-
-Checks whether the type is `RAT_KING`.
-
-### `is_cat_type()`
-
-Checks whether the type is `CAT`.
-
-### `ordinal()`
-
-Returns the enum's numerical value.
-
-## 6.3 Example
-
-```python
-my_type = rc.get_type()
-
-if my_type.is_baby_rat_type():
-    log("I am a baby rat")
-
-elif my_type.is_rat_king_type():
-    log("I am a rat king")
-
-elif my_type.is_cat_type():
-    log("I am a cat")
-```
-
----
-
-# 7. TrapType
-
-`TrapType` describes the available trap types.
-
-The supplied API defines:
-
-- `RAT_TRAP`
-- `CAT_TRAP`
-- `NONE`
-
-## 7.1 Trap Attributes
-
-| Attribute | RAT_TRAP | CAT_TRAP | NONE |
-|---|---:|---:|---:|
-| Build cost | 30 | 10 | 0 |
-| Damage | 50 | 100 | 0 |
-| Stun time | 20 | 20 | 0 |
-| Action cooldown | 15 | 10 | 0 |
-| Maximum count | 25 | 10 | 0 |
-| Trigger radius squared | 2 | 2 | 0 |
-
-## 7.2 Available Attributes
-
-Each trap type exposes:
-
-```python
-build_cost
-damage
-stun_time
-action_cooldown
-max_count
-trigger_radius_squared
-```
-
-It also provides:
-
-```python
-ordinal()
-```
-
-Example:
-
-```python
-trap = TrapType.RAT_TRAP
-
-log("Build cost:", trap.build_cost)
-log("Damage:", trap.damage)
-log("Maximum count:", trap.max_count)
-```
-
----
-
-# 8. RobotInfo
-
-`RobotInfo` contains information about a robot detected by the sensing API.
-
-It exposes the following fields:
-
-| Field | Description |
-|---|---|
-| `id` | Robot ID |
-| `team` | Robot's team |
-| `type` | Robot's UnitType |
-| `health` | Robot's health |
-| `location` | Robot's location |
-| `direction` | Robot's direction |
-| `chirality` | Chirality value |
-| `cheese_amount` | Cheese amount |
-| `carrying_robot` | Information about the robot being carried |
-
-## 8.1 Example
-
-```python
-robots = rc.sense_nearby_robots()
-
-for robot in robots:
-    log("Robot ID:", robot.id)
-    log("Team:", robot.team)
-    log("Type:", robot.type)
-    log("Health:", robot.health)
-    log("Location:", robot.location)
-```
-
-## 8.2 Detecting Enemies
-
-```python
-my_team = rc.get_team()
-
-robots = rc.sense_nearby_robots()
-
-for robot in robots:
-
-    if robot.team != my_team:
-        log("Enemy detected:", robot.id)
-```
-
-The `RobotInfo` object provides the information returned by the engine. It does not itself perform sensing.
-
----
-
-# 9. MapInfo
-
-`MapInfo` represents information about a map location.
-
-It exposes these fields:
-
-| Field | Description |
-|---|---|
-| `location` | Location represented by the object |
-| `is_passable` | Whether the location is passable |
-| `flying_robot` | Flying-robot information |
-| `is_wall` | Whether the location is a wall |
-| `is_dirt` | Whether the location contains dirt |
-| `cheese_amount` | Cheese amount at the location |
-| `trap` | Trap information |
-| `has_cheese_mine` | Whether a cheese mine is present |
-
-## 9.1 Example
-
-```python
-location = rc.get_location().add(Direction.NORTH)
-
-if rc.can_sense_location(location):
-
-    info = rc.sense_map_info(location)
-
-    log("Passable:", info.is_passable)
-    log("Wall:", info.is_wall)
-    log("Dirt:", info.is_dirt)
-    log("Cheese:", info.cheese_amount)
-    log("Trap:", info.trap)
-```
-
----
-
-# 10. Message
-
-`Message` represents a message received through the communication system.
-
-The constructor in the supplied source is:
-
-```python
-Message(message_bytes, sender_id, round, source_loc)
-```
-
-It exposes:
-
-| Field | Description |
-|---|---|
-| `bytes` | Message bytes |
-| `sender_id` | Sender robot ID |
-| `round` | Round associated with the message |
-| `source_loc` | Message source location |
-
-Example:
-
-```python
-messages = rc.read_squeaks(rc.get_round_num())
-
-for message in messages:
-
-    log("Sender:", message.sender_id)
-    log("Round:", message.round)
-    log("Location:", message.source_loc)
-    log("Bytes:", message.bytes)
-```
-
----
-
-# 11. RobotController API
-
-This is the main section of the reference.
-
-`RobotController` contains the methods your bot uses to interact with the game.
-
-The API methods are grouped into:
-
-1. Game state and map information.
-2. Movement and turning.
-3. Sensing.
-4. Combat and robot interactions.
-5. Cheese, dirt, and traps.
-6. Communication.
-7. Indicators.
-8. Other control methods.
-
-All methods below are called through:
-
-```python
-rc.method_name(...)
-```
-
----
-
-# 12. Game State and Map Methods
-
-## 12.1 `get_round_num()`
-
-**Signature:**
-
-```python
-rc.get_round_num() -> int
-```
-
-Returns the current round number.
-
-Example:
-
-```python
-round_number = rc.get_round_num()
-
-log("Current round:", round_number)
-```
-
-## 12.2 `get_map_width()`
-
-**Signature:**
-
-```python
-rc.get_map_width() -> int
-```
-
-Returns the width of the map.
-
-## 12.3 `get_map_height()`
-
-**Signature:**
-
-```python
-rc.get_map_height() -> int
-```
-
-Returns the height of the map.
-
-Example:
-
-```python
-width = rc.get_map_width()
-height = rc.get_map_height()
-
-log("Map dimensions:", width, height)
-```
-
-## 12.4 `get_location()`
-
-**Signature:**
-
-```python
-rc.get_location() -> MapLocation
-```
-
-Returns the current robot's location.
-
-Example:
-
-```python
-location = rc.get_location()
-
-log(location.x, location.y)
-```
-
-## 12.5 `get_direction()`
-
-**Signature:**
-
-```python
-rc.get_direction() -> Direction
-```
-
-Returns the robot's current direction.
-
-## 12.6 `get_id()`
-
-**Signature:**
-
-```python
-rc.get_id() -> int
-```
-
-Returns the robot's ID.
-
-## 12.7 `get_team()`
-
-**Signature:**
-
-```python
-rc.get_team() -> Team
-```
-
-Returns the robot's team.
-
-## 12.8 `get_type()`
-
-**Signature:**
-
-```python
-rc.get_type() -> UnitType
-```
-
-Returns the robot's unit type.
-
-## 12.9 `get_health()`
-
-**Signature:**
-
-```python
-rc.get_health() -> int
-```
-
-Returns the robot's health.
-
-## 12.10 `on_the_map(loc)`
-
-**Signature:**
-
-```python
-rc.on_the_map(loc: MapLocation) -> bool
-```
-
-Checks whether a location is on the map.
-
-Example:
-
-```python
-target = MapLocation(5, 5)
-
-if rc.on_the_map(target):
-    log("Location is on the map")
-```
-
-## 12.11 `is_location_occupied(loc)`
-
-**Signature:**
-
-```python
-rc.is_location_occupied(loc: MapLocation) -> bool
-```
-
-Checks whether a location is occupied.
-
-## 12.12 `adjacent_location(dir)`
-
-**Signature:**
-
-```python
-rc.adjacent_location(dir: Direction) -> MapLocation
-```
-
-Returns the location adjacent to the robot in the specified direction.
-
-Example:
-
-```python
-north_location = rc.adjacent_location(Direction.NORTH)
-```
-
-## 12.13 `get_all_locations_within_radius_squared(center, radius_squared)`
-
-**Signature:**
-
-```python
-rc.get_all_locations_within_radius_squared(
-    center: MapLocation,
-    radius_squared: int
-) -> list[MapLocation]
-```
-
-Returns locations within the specified squared radius of a center location.
-
-## 12.14 `get_all_part_locations()`
-
-**Signature:**
-
-```python
-rc.get_all_part_locations() -> list[MapLocation]
-```
-
-Returns all locations identified by the engine as part locations.
-
-The supplied wrapper does not explain the exact meaning of "part locations."
-
----
-
-# 13. Movement and Turning
-
-Movement methods allow a robot to change its position or direction.
-
-The API provides methods for checking movement, moving, turning, and checking cooldown readiness.
-
-## 13.1 `can_move(dir)`
-
-**Signature:**
-
-```python
-rc.can_move(dir: Direction) -> bool
-```
-
-Checks whether the robot can move in the specified direction.
-
-Example:
-
-```python
-if rc.can_move(Direction.NORTH):
-    log("North movement is possible")
-```
-
-## 13.2 `move(dir)`
-
-**Signature:**
-
-```python
-rc.move(dir: Direction) -> None
-```
-
-Attempts to move the robot in the specified direction.
-
-Example:
-
-```python
-if rc.can_move(Direction.EAST):
-    rc.move(Direction.EAST)
-```
-
-## 13.3 `can_move_forward()`
-
-**Signature:**
-
-```python
-rc.can_move_forward() -> bool
-```
-
-Checks whether the robot can move forward.
-
-## 13.4 `move_forward()`
-
-**Signature:**
-
-```python
-rc.move_forward() -> None
-```
-
-Attempts to move the robot forward.
-
-## 13.5 `can_turn(dir=...)`
-
-**Signature:**
-
-```python
-rc.can_turn(dir: Direction = ...) -> bool
-```
-
-Checks whether turning is possible.
-
-The supplied wrapper supports both:
-
-```python
-rc.can_turn()
-```
-
-and:
-
-```python
-rc.can_turn(Direction.NORTH)
-```
-
-## 13.6 `turn(dir)`
-
-**Signature:**
-
-```python
-rc.turn(dir: Direction) -> None
-```
-
-Attempts to turn the robot toward the specified direction.
-
-Example:
-
-```python
-if rc.can_turn(Direction.WEST):
-    rc.turn(Direction.WEST)
-```
-
-## 13.7 Movement Readiness
-
-### `is_movement_ready()`
-
-```python
-rc.is_movement_ready() -> bool
-```
-
-Returns whether movement is ready.
-
-### `is_turning_ready()`
-
-```python
-rc.is_turning_ready() -> bool
-```
-
-Returns whether turning is ready.
-
-### `is_action_ready()`
-
-```python
-rc.is_action_ready() -> bool
-```
-
-Returns whether the action channel is ready.
-
-## 13.8 Cooldown Methods
-
-### `get_movement_cooldown_turns()`
-
-```python
-rc.get_movement_cooldown_turns() -> int
-```
-
-Returns the movement cooldown in turns.
-
-### `get_turning_cooldown_turns()`
-
-```python
-rc.get_turning_cooldown_turns() -> int
-```
-
-Returns the turning cooldown in turns.
-
-### `get_action_cooldown_turns()`
-
-```python
-rc.get_action_cooldown_turns() -> int
-```
-
-Returns the action cooldown in turns.
-
-Example:
-
-```python
-if not rc.is_movement_ready():
-
-    cooldown = rc.get_movement_cooldown_turns()
-
-    log("Movement cooldown:", cooldown)
-```
-
----
-
-# 14. Sensing Methods
-
-Sensing allows your robot to inspect its surroundings.
-
-The API provides methods for sensing locations, robots, map information, and passability.
-
-## 14.1 `can_sense_location(loc)`
-
-**Signature:**
-
-```python
-rc.can_sense_location(loc: MapLocation) -> bool
-```
-
-Checks whether a particular location can be sensed.
-
-Example:
-
-```python
-target = rc.get_location().add(Direction.NORTH)
-
-if rc.can_sense_location(target):
-    log("Location is within sensing range")
-```
-
-## 14.2 `can_sense_robot(id)`
-
-**Signature:**
-
-```python
-rc.can_sense_robot(id: int) -> bool
-```
-
-Checks whether a robot with the specified ID can be sensed.
-
-## 14.3 `can_sense_robot_at_location(loc)`
-
-**Signature:**
-
-```python
-rc.can_sense_robot_at_location(loc: MapLocation) -> bool
-```
-
-Checks whether a robot at the specified location can be sensed.
-
-## 14.4 `sense_map_info(loc)`
-
-**Signature:**
-
-```python
-rc.sense_map_info(loc: MapLocation) -> MapInfo
-```
-
-Returns map information for a specific location.
-
-Example:
-
-```python
-location = rc.get_location().add(Direction.NORTH)
-
-if rc.can_sense_location(location):
-
-    info = rc.sense_map_info(location)
-
-    log("Wall:", info.is_wall)
-    log("Dirt:", info.is_dirt)
-```
-
-## 14.5 `sense_nearby_map_infos(...)`
-
-**Signature:**
-
-```python
-rc.sense_nearby_map_infos(
-    center: MapLocation = ...,
-    radius_squared: int = ...
-) -> list[MapInfo]
-```
-
-Returns map information for nearby locations.
-
-The supplied wrapper supports these forms:
-
-```python
-rc.sense_nearby_map_infos()
-```
-
-```python
-rc.sense_nearby_map_infos(center)
-```
-
-```python
-rc.sense_nearby_map_infos(radius_squared=20)
-```
-
-```python
-rc.sense_nearby_map_infos(
-    center,
-    radius_squared=20
-)
-```
-
-Example:
-
-```python
-map_infos = rc.sense_nearby_map_infos()
-
-for info in map_infos:
-
-    if info.is_wall:
-        log("Wall at:", info.location)
-```
-
-## 14.6 `sense_nearby_robots(...)`
-
-**Signature:**
-
-```python
-rc.sense_nearby_robots(
-    center: MapLocation = ...,
-    radius_squared: int = ...,
-    team: Team = ...
-) -> list[RobotInfo]
-```
-
-Returns information about nearby robots.
-
-The supplied wrapper supports these forms:
-
-```python
-rc.sense_nearby_robots()
-```
-
-```python
-rc.sense_nearby_robots(radius_squared=20)
-```
-
-```python
-rc.sense_nearby_robots(
-    radius_squared=20,
-    team=Team.A
-)
-```
-
-```python
-rc.sense_nearby_robots(
-    center,
-    radius_squared=20,
-    team=Team.A
-)
-```
-
-**Important:** The wrapper explicitly rejects other argument combinations with `ValueError`.
-
-Example:
-
-```python
-robots = rc.sense_nearby_robots()
-
-for robot in robots:
-
-    log(robot.id)
-    log(robot.team)
-    log(robot.location)
-```
-
-## 14.7 `sense_passability(loc)`
-
-**Signature:**
-
-```python
-rc.sense_passability(loc: MapLocation) -> int
-```
-
-Returns the passability value for a location.
-
-The wrapper declares the return type as `int`. It does not explain the passability scale or its full interpretation.
-
-## 14.8 `sense_robot(id)`
-
-**Signature:**
-
-```python
-rc.sense_robot(id: int) -> RobotInfo
-```
-
-Returns information about a robot using its ID.
-
-## 14.9 `sense_robot_at_location(loc)`
-
-**Signature:**
-
-```python
-rc.sense_robot_at_location(loc: MapLocation) -> RobotInfo
-```
-
-Returns information about a robot at a specific location.
-
----
-
-# 15. Combat and Robot Interaction
-
-These methods provide access to attacking, building rats, becoming a rat king, carrying rats, and throwing rats.
-
-## 15.1 Attacking
-
-### `can_attack(loc, cheese_amount=0)`
-
-```python
-rc.can_attack(
-    loc: MapLocation,
-    cheese_amount: int = 0
-) -> bool
-```
-
-Checks whether an attack can be performed at the specified location.
-
-The method accepts an optional cheese amount.
-
-### `attack(loc, cheese_amount=0)`
-
-```python
-rc.attack(
-    loc: MapLocation,
-    cheese_amount: int = 0
-) -> None
-```
-
-Attempts to attack the specified location.
-
-Example:
-
-```python
-target = rc.get_location().add(Direction.EAST)
-
-if rc.can_attack(target):
-    rc.attack(target)
-```
-
-## 15.2 Becoming a Rat King
-
-### `can_become_rat_king()`
-
-```python
-rc.can_become_rat_king() -> bool
-```
-
-Checks whether the robot can become a rat king.
-
-### `become_rat_king()`
-
-```python
-rc.become_rat_king() -> None
-```
-
-Attempts to become a rat king.
-
-Example:
-
-```python
-if rc.can_become_rat_king():
-    rc.become_rat_king()
-```
-
-## 15.3 Building Rats
-
-### `can_build_rat(loc)`
-
-```python
-rc.can_build_rat(loc: MapLocation) -> bool
-```
-
-Checks whether a rat can be built at the specified location.
-
-### `build_rat(loc)`
-
-```python
-rc.build_rat(loc: MapLocation) -> None
-```
-
-Attempts to build a rat at the specified location.
-
-Example:
-
-```python
-target = rc.get_location().add(Direction.NORTH)
-
-if rc.can_build_rat(target):
-    rc.build_rat(target)
-```
-
-## 15.4 Carrying Rats
-
-### `can_carry_rat(loc)`
-
-```python
-rc.can_carry_rat(loc: MapLocation) -> bool
-```
-
-Checks whether a rat at the specified location can be carried.
-
-### `carry_rat(loc)`
-
-```python
-rc.carry_rat(loc: MapLocation) -> None
-```
-
-Attempts to carry a rat at the specified location.
-
-## 15.5 Dropping Rats
-
-### `can_drop_rat(dir)`
-
-```python
-rc.can_drop_rat(dir: Direction) -> bool
-```
-
-Checks whether a carried rat can be dropped in the specified direction.
-
-### `drop_rat(dir)`
-
-```python
-rc.drop_rat(dir: Direction) -> None
-```
-
-Attempts to drop a carried rat.
-
-## 15.6 Throwing Rats
-
-### `can_throw_rat()`
-
-```python
-rc.can_throw_rat() -> bool
-```
-
-Checks whether throwing a rat is possible.
-
-### `throw_rat()`
-
-```python
-rc.throw_rat() -> None
-```
-
-Attempts to throw a rat.
-
-## 15.7 Carrying and Throwing Status
-
-### `is_being_carried()`
-
-```python
-rc.is_being_carried() -> bool
-```
-
-Checks whether the current robot is being carried.
-
-### `is_being_thrown()`
-
-```python
-rc.is_being_thrown() -> bool
-```
-
-Checks whether the current robot is being thrown.
-
-### `get_carrying()`
-
-```python
-rc.get_carrying() -> RobotInfo
-```
-
-Returns information about the robot currently being carried.
-
----
-
-# 16. Cheese Methods
-
-Cheese is a resource that can be collected and transferred.
-
-The API exposes methods for picking up cheese, transferring cheese, and checking cheese amounts.
-
-## 16.1 `can_pick_up_cheese(loc)`
-
-```python
-rc.can_pick_up_cheese(loc: MapLocation) -> bool
-```
-
-Checks whether cheese can be picked up at a location.
-
-## 16.2 `pick_up_cheese(loc, amount=...)`
-
-```python
-rc.pick_up_cheese(
-    loc: MapLocation,
-    amount: int = ...
-) -> None
-```
-
-Attempts to pick up cheese at the specified location.
-
-The amount parameter is optional.
-
-The supplied wrapper supports:
-
-```python
-rc.pick_up_cheese(location)
-```
-
-and:
-
-```python
-rc.pick_up_cheese(location, amount)
-```
-
-When an amount is supplied, the wrapper dispatches to a separate engine method.
-
-## 16.3 `can_transfer_cheese(loc, cheese_amount)`
-
-```python
-rc.can_transfer_cheese(
-    loc: MapLocation,
-    cheese_amount: int
-) -> bool
-```
-
-Checks whether the specified amount of cheese can be transferred to a location.
-
-## 16.4 `transfer_cheese(loc, cheese_amount)`
-
-```python
-rc.transfer_cheese(
-    loc: MapLocation,
-    cheese_amount: int
-) -> None
-```
-
-Attempts to transfer cheese.
-
-Example:
-
-```python
-target = rc.get_location().add(Direction.NORTH)
-
-if rc.can_transfer_cheese(target, 10):
-    rc.transfer_cheese(target, 10)
-```
-
-## 16.5 Cheese Amount Methods
-
-### `get_all_cheese()`
-
-```python
-rc.get_all_cheese() -> int
-```
-
-Returns the value reported by the all-cheese query.
-
-### `get_global_cheese()`
-
-```python
-rc.get_global_cheese() -> int
-```
-
-Returns the global cheese amount.
-
-### `get_raw_cheese()`
-
-```python
-rc.get_raw_cheese() -> int
-```
-
-Returns the raw cheese amount.
-
-The supplied wrapper declares these return types but does not fully define the differences between their underlying values.
-
----
-
-# 17. Dirt Methods
-
-The API includes methods for checking, placing, and removing dirt.
-
-## 17.1 `get_dirt()`
-
-```python
-rc.get_dirt() -> int
-```
-
-Returns the robot's dirt amount.
-
-## 17.2 `can_place_dirt(loc)`
-
-```python
-rc.can_place_dirt(loc: MapLocation) -> bool
-```
-
-Checks whether dirt can be placed at the specified location.
-
-## 17.3 `place_dirt(loc)`
-
-```python
-rc.place_dirt(loc: MapLocation) -> None
-```
-
-Attempts to place dirt at the specified location.
-
-## 17.4 `can_remove_dirt(loc)`
-
-```python
-rc.can_remove_dirt(loc: MapLocation) -> bool
-```
-
-Checks whether dirt can be removed from a location.
-
-## 17.5 `remove_dirt(loc)`
-
-```python
-rc.remove_dirt(loc: MapLocation) -> None
-```
-
-Attempts to remove dirt from the specified location.
-
-Example:
-
-```python
-target = rc.get_location().add(Direction.NORTH)
-
-if rc.can_remove_dirt(target):
-    rc.remove_dirt(target)
-```
-
----
-
-# 18. Trap Methods
-
-The API provides separate methods for rat traps and cat traps.
-
-## 18.1 Rat Traps
-
-### `can_place_rat_trap(loc)`
-
-```python
-rc.can_place_rat_trap(loc: MapLocation) -> bool
-```
-
-Checks whether a rat trap can be placed.
-
-### `place_rat_trap(loc)`
-
-```python
-rc.place_rat_trap(loc: MapLocation) -> None
-```
-
-Attempts to place a rat trap.
-
-### `can_remove_rat_trap(loc)`
-
-```python
-rc.can_remove_rat_trap(loc: MapLocation) -> bool
-```
-
-Checks whether a rat trap can be removed.
-
-### `remove_rat_trap(loc)`
-
-```python
-rc.remove_rat_trap(loc: MapLocation) -> None
-```
-
-Attempts to remove a rat trap.
-
-## 18.2 Cat Traps
-
-### `can_place_cat_trap(loc)`
-
-```python
-rc.can_place_cat_trap(loc: MapLocation) -> bool
-```
-
-Checks whether a cat trap can be placed.
-
-### `place_cat_trap(loc)`
-
-```python
-rc.place_cat_trap(loc: MapLocation) -> None
-```
-
-Attempts to place a cat trap.
-
-### `can_remove_cat_trap(loc)`
-
-```python
-rc.can_remove_cat_trap(loc: MapLocation) -> bool
-```
-
-Checks whether a cat trap can be removed.
-
-### `remove_cat_trap(loc)`
-
-```python
-rc.remove_cat_trap(loc: MapLocation) -> None
-```
-
-Attempts to remove a cat trap.
-
-## 18.3 Trap Count Methods
-
-### `get_number_rat_traps()`
-
-```python
-rc.get_number_rat_traps() -> int
-```
-
-Returns the number of rat traps reported by the engine.
-
-### `get_number_cat_traps()`
-
-```python
-rc.get_number_cat_traps() -> int
-```
-
-Returns the number of cat traps reported by the engine.
-
-### `get_current_rat_cost()`
-
-```python
-rc.get_current_rat_cost() -> int
-```
-
-Returns the current rat-building cost.
-
----
-
-# 19. Communication Methods
-
-The API provides two communication mechanisms in the supplied wrapper:
-
-1. Shared array.
-2. Squeak messages.
-
-## 19.1 Shared Array
-
-The supplied constants define:
-
-```python
-SHARED_ARRAY_SIZE = 64
-COMM_ARRAY_MAX_VALUE = 1023
-```
-
-### `read_shared_array(index)`
-
-```python
-rc.read_shared_array(index: int) -> int
-```
-
-Reads a value from a shared-array index.
-
-Example:
-
-```python
-value = rc.read_shared_array(0)
-
-log("Shared value:", value)
-```
-
-### `write_shared_array(index, value)`
-
-```python
-rc.write_shared_array(
-    index: int,
-    value: int
-) -> None
-```
-
-Writes a value to a shared-array index.
-
-Example:
-
-```python
-rc.write_shared_array(0, 100)
-```
-
-## 19.2 Squeak Messages
-
-### `squeak(squeak)`
-
-```python
-rc.squeak(squeak: int) -> None
-```
-
-Sends an integer squeak value.
-
-Example:
-
-```python
-rc.squeak(123)
-```
-
-### `read_squeaks(roundNum)`
-
-```python
-rc.read_squeaks(roundNum: int) -> list[Message]
-```
-
-Reads squeak messages for the specified round.
-
-Example:
-
-```python
-current_round = rc.get_round_num()
-
-messages = rc.read_squeaks(current_round)
-
-for message in messages:
-
-    log("Message from:", message.sender_id)
-    log("Message round:", message.round)
-    log("Message data:", message.bytes)
-```
-
-The supplied constants include:
-
-```python
-MESSAGE_ROUND_DURATION = 5
-MAX_MESSAGES_SENT_ROBOT = 1
-SQUEAK_RADIUS_SQUARED = 16
-```
-
-These are reference values from `GameConstants`.
-
----
-
-# 20. Indicator Methods
-
-Indicators help display information about a bot during debugging or visualization.
-
-The API provides methods for dots, lines, strings, and timeline markers.
-
-## 20.1 `set_indicator_dot(loc, r, g, b)`
-
-```python
-rc.set_indicator_dot(
-    loc: MapLocation,
-    r: int,
-    g: int,
-    b: int
-) -> None
-```
-
-Sets a colored indicator dot at a location.
-
-Example:
-
-```python
-location = rc.get_location()
-
-rc.set_indicator_dot(
-    location,
-    255,
-    0,
-    0
-)
-```
-
-## 20.2 `set_indicator_string(text)`
-
-```python
-rc.set_indicator_string(text: str) -> None
-```
-
-Sets an indicator string.
-
-Example:
-
-```python
-rc.set_indicator_string("Searching for enemies")
-```
-
-The supplied constants define:
-
-```python
-INDICATOR_STRING_MAX_LENGTH = 256
-```
-
-## 20.3 `set_indicator_line(startLoc, endLoc, r, g, b)`
-
-```python
-rc.set_indicator_line(
-    startLoc: MapLocation,
-    endLoc: MapLocation,
-    r: int,
-    g: int,
-    b: int
-) -> None
-```
-
-Draws a colored line between two locations.
-
-Example:
-
-```python
-start = rc.get_location()
-end = start.add(Direction.NORTH)
-
-rc.set_indicator_line(
-    start,
-    end,
-    0,
-    255,
-    0
-)
-```
-
-## 20.4 `set_timeline_marker(text, r, g, b)`
-
-```python
-rc.set_timeline_marker(
-    text: str,
-    r: int,
-    g: int,
-    b: int
-) -> None
-```
-
-Adds a colored timeline marker.
-
-The supplied constants define:
-
-```python
-TIMELINE_LABEL_MAX_LENGTH = 64
-```
-
----
-
-# 21. Other RobotController Methods
-
-## 21.1 `get_backstabbing_team()`
-
-```python
-rc.get_backstabbing_team() -> Team
-```
-
-Returns the backstabbing team reported by the engine.
-
-The wrapper does not further define the meaning of this value.
-
-## 21.2 `is_cooperation()`
-
-```python
-rc.is_cooperation() -> bool
-```
-
-Returns the cooperation flag reported by the engine.
-
-The wrapper does not further explain its meaning.
-
-## 21.3 `disintegrate()`
-
-```python
-rc.disintegrate() -> None
-```
-
-Attempts to disintegrate the current robot.
-
-## 21.4 `resign()`
-
-```python
-rc.resign() -> None
-```
-
-Resigns from the game.
-
----
-
-# 22. Global Helper Functions
-
-In addition to `RobotController`, the supplied wrapper exposes several global helper functions.
-
-These are available through the Python game environment.
-
-## 22.1 `log(*messages)`
-
-**Signature:**
-
-```python
-log(*messages) -> None
-```
-
-Converts the supplied arguments to strings, joins them with spaces, and sends the result to the engine log.
-
-Example:
-
-```python
-log("Round:", rc.get_round_num())
-log("Location:", rc.get_location())
-log("Health:", rc.get_health())
-```
-
-## 22.2 `bottom_left_distance_squared_to(loc1, loc2)`
-
-**Signature:**
-
-```python
-bottom_left_distance_squared_to(loc1, loc2) -> int
-```
-
-Returns a squared-distance value using the bottom-left location convention.
-
-## 22.3 `direction_to(loc1, loc2)`
-
-**Signature:**
-
-```python
-direction_to(loc1, loc2) -> Direction
-```
-
-Returns the direction from one location toward another.
-
-Example:
-
-```python
-a = MapLocation(2, 2)
-b = MapLocation(5, 2)
-
-direction = direction_to(a, b)
-
-log(direction)
-```
-
-## 22.4 `distance_squared_to(loc1, loc2)`
-
-**Signature:**
-
-```python
-distance_squared_to(loc1, loc2) -> int
-```
-
-Returns the squared distance between two locations.
-
-## 22.5 `is_adjacent_to(loc1, loc2)`
-
-**Signature:**
-
-```python
-is_adjacent_to(loc1, loc2) -> bool
-```
-
-Checks whether two locations are adjacent.
-
-## 22.6 `is_within_distance_squared(...)`
-
-**Signature:**
-
-```python
-is_within_distance_squared(
-    loc1,
-    loc2,
-    distance_squared,
-    theta=360,
-    use_bottom_left=False
-) -> bool
-```
-
-Checks whether two locations satisfy a squared-distance condition, with optional angle and bottom-left location settings.
-
-Parameters:
-
-| Parameter | Description |
-|---|---|
-| `loc1` | First location |
-| `loc2` | Second location |
-| `distance_squared` | Squared-distance threshold |
-| `theta` | Optional angle parameter; defaults to 360 |
-| `use_bottom_left` | Whether to use bottom-left distance convention |
-
-The supplied wrapper does not fully document the angle reference or boundary behavior.
-
-## 22.7 `get_all_type_locations(unit_type, center)`
-
-**Signature:**
-
-```python
-get_all_type_locations(
-    unit_type,
-    center
-) -> list[MapLocation]
-```
-
-Returns locations for the specified unit type around a center.
-
----
-
-# 23. GameActionException
-
-The API defines:
-
-```python
-GameActionException
-```
-
-It also defines the enum:
-
-```python
-GameActionExceptionType
-```
-
-A `GameActionException` stores its exception category in:
-
-```python
-exception.type
-```
-
-The exception also has string and representation methods.
-
-## 23.1 Exception Types
-
-| Exception type | Value | Meaning suggested by name |
-|---|---:|---|
-| `INTERNAL_ERROR` | 0 | Internal error |
-| `NOT_ENOUGH_RESOURCE` | 1 | Not enough resources |
-| `CANT_MOVE_THERE` | 2 | Cannot move there |
-| `IS_NOT_READY` | 3 | Robot or action is not ready |
-| `CANT_SENSE_THAT` | 4 | Cannot sense the requested target |
-| `OUT_OF_RANGE` | 5 | Target is out of range |
-| `CANT_DO_THAT` | 6 | Action cannot be performed |
-| `NO_ROBOT_THERE` | 7 | No robot at the specified location |
-| `ROUND_OUT_OF_RANGE` | 8 | Requested round is out of range |
-
-The descriptions are interpretations of the enum names, not extended formal definitions from the wrapper source.
-
----
-
-# 24. GameConstants
-
-`GameConstants` exposes reference values used by the game.
-
-**Important:** The supplied `classes.py` docstring explicitly states that modifying these constants on the Python side does not affect the actual game.
-
-Use them as reference values rather than as configuration variables.
-
-## 24.1 General Game Constants
-
-| Constant | Value |
-|---|---:|
-| `SPEC_VERSION` | 1 |
-| `GAME_DEFAULT_SEED` | 6370 |
-| `GAME_MAX_NUMBER_OF_ROUNDS` | 2000 |
-| `MAX_TEAM_EXECUTION_TIME` | 1200000000000 |
-| `EXCEPTION_BYTECODE_PENALTY` | 500 |
-
-## 24.2 Map Constants
-
-| Constant | Value |
-|---|---:|
-| `MAP_MIN_HEIGHT` | 20 |
-| `MAP_MAX_HEIGHT` | 60 |
-| `MAP_MIN_WIDTH` | 20 |
-| `MAP_MAX_WIDTH` | 60 |
-| `MAX_DIRT_PERCENTAGE` | 50 |
-| `MAX_WALL_PERCENTAGE` | 20 |
-| `MIN_CHEESE_MINE_SPACING_SQUARED` | 25 |
-
-## 24.3 Indicator Constants
-
-| Constant | Value |
-|---|---:|
-| `INDICATOR_STRING_MAX_LENGTH` | 256 |
-| `TIMELINE_LABEL_MAX_LENGTH` | 64 |
-
-## 24.4 Team and Rat King Constants
-
-| Constant | Value |
-|---|---:|
-| `INITIAL_TEAM_CHEESE` | 2500 |
-| `NUMBER_INITIAL_RAT_KINGS` | 1 |
-| `MAX_NUMBER_OF_RAT_KINGS` | 5 |
-| `MAX_NUMBER_OF_RAT_KINGS_AFTER_CUTOFF` | 2 |
-| `RAT_KING_CUTOFF_ROUND` | 1200 |
-| `RAT_KING_CHEESE_CONSUMPTION` | 2 |
-| `RAT_KING_HEALTH_LOSS` | 10 |
-| `RAT_KING_UPGRADE_CHEESE_COST` | 50 |
-
-## 24.5 Cheese Constants
-
-| Constant | Value |
-|---|---:|
-| `CHEESE_COOLDOWN_PENALTY` | 0.01 |
-| `CHEESE_MINE_SPAWN_PROBABILITY` | 0.01 |
-| `CHEESE_SPAWN_RADIUS` | 4 |
-| `CHEESE_SPAWN_AMOUNT` | 20 |
-| `CHEESE_TRANSFER_RADIUS_SQUARED` | 9 |
-| `CHEESE_PICK_UP_RADIUS_SQUARED` | 2 |
-
-## 24.6 Building Constants
-
-| Constant | Value |
-|---|---:|
-| `BUILD_ROBOT_RADIUS_SQUARED` | 4 |
-| `BUILD_ROBOT_BASE_COST` | 10 |
-| `BUILD_ROBOT_COST_INCREASE` | 10 |
-| `NUM_ROBOTS_FOR_COST_INCREASE` | 4 |
-| `BUILD_DISTANCE_SQUARED` | 2 |
-| `RAT_KING_BUILD_DISTANCE_SQUARED` | 8 |
-| `BUILD_ROBOT_COOLDOWN` | 10 |
-
-## 24.7 Attack and Damage Constants
-
-| Constant | Value |
-|---|---:|
-| `ATTACK_DISTANCE_SQUARED` | 2 |
-| `RAT_KING_ATTACK_DISTANCE_SQUARED` | 8 |
-| `THROW_DAMAGE` | 20 |
-| `THROW_DAMAGE_PER_TILE` | 5 |
-| `RAT_BITE_DAMAGE` | 10 |
-| `CAT_SCRATCH_DAMAGE` | 50 |
-| `CAT_POUNCE_MAX_DISTANCE_SQUARED` | 9 |
-| `HEALTH_GRAB_THRESHOLD` | 0 |
-
-## 24.8 Dirt and Trap-Related Constants
-
-| Constant | Value |
-|---|---:|
-| `DIG_DIRT_CHEESE_COST` | 5 |
-| `PLACE_DIRT_CHEESE_COST` | 3 |
-| `DIG_COOLDOWN` | 25 |
-| `CAT_DIG_ADDITIONAL_COOLDOWN` | 5 |
-
-## 24.9 Communication Constants
-
-| Constant | Value |
-|---|---:|
-| `MESSAGE_ROUND_DURATION` | 5 |
-| `MAX_MESSAGES_SENT_ROBOT` | 1 |
-| `SQUEAK_RADIUS_SQUARED` | 16 |
-| `SHARED_ARRAY_SIZE` | 64 |
-| `COMM_ARRAY_MAX_VALUE` | 1023 |
-
-## 24.10 Cooldown Constants
-
-| Constant | Value |
-|---|---:|
-| `COOLDOWN_LIMIT` | 10 |
-| `COOLDOWNS_PER_TURN` | 10 |
-| `TURNING_COOLDOWN` | 10 |
-| `CHEESE_TRANSFER_COOLDOWN` | 10 |
-| `MOVE_STRAFE_COOLDOWN` | 18 |
-
-## 24.11 Carrying and Throwing Constants
-
-| Constant | Value |
-|---|---:|
-| `CARRY_COOLDOWN_MULTIPLIER` | 1.5 |
-| `MAX_CARRY_TOWER_HEIGHT` | 2 |
-| `MAX_CARRY_DURATION` | 10 |
-| `SAME_ROBOT_CARRY_COOLDOWN_TURNS` | 2 |
-| `THROW_DURATION` | 4 |
-| `HIT_GROUND_COOLDOWN` | 10 |
-| `HIT_TARGET_COOLDOWN` | 30 |
-
-## 24.12 Other Constants
-
-| Constant | Value |
-|---|---:|
-| `CAT_SLEEP_TIME` | 2 |
-
----
-
-# 25. Practical Coding Patterns
-
-This chapter combines the API methods into simple patterns that can be used when writing a bot.
-
-These are examples of API usage, not complete strategies.
-
-## 25.1 Basic Turn Structure
-
-A simple turn function might look like this:
-
-```python
-def turn():
-
-    current_round = rc.get_round_num()
-    location = rc.get_location()
-    unit_type = rc.get_type()
-
-    log("Round:", current_round)
-    log("Location:", location)
-    log("Unit:", unit_type)
-```
-
-## 25.2 Check Before Moving
-
-Use the movement check before calling the movement method.
-
-```python
-def move_north():
-
-    if rc.can_move(Direction.NORTH):
-
-        rc.move(Direction.NORTH)
-
+# 8 movement directions in clockwise order (index + 1 == 45 degrees clockwise).
+NAV_DIRS = [
+    Direction.NORTH, Direction.NORTHEAST, Direction.EAST, Direction.SOUTHEAST,
+    Direction.SOUTH, Direction.SOUTHWEST, Direction.WEST, Direction.NORTHWEST,
+]
+
+# Per-robot navigation memory. Every robot runs in its own sandbox, so this
+# dict is private to the robot. It is mutated (never reassigned), so no
+# `global` statement is needed.
+_nav = {
+    "target": None,       # (x, y) we are currently heading to
+    "following": False,   # True while hugging an obstacle
+    "heading": None,      # direction we last moved while hugging
+    "start_dist": 0,      # distance to target when we started hugging
+    "left_hand": True,    # which way we go around obstacles
+    "follow_turns": 0,    # turns spent hugging without getting closer
+}
+
+
+def nav_dir_toward(a, b):
+    """Same result as the engine's direction_to(a, b), computed locally (no engine call)."""
+    dx = b.x - a.x
+    dy = b.y - a.y
+    adx = abs(dx)
+    ady = abs(dy)
+    if adx >= 2.414 * ady:
+        if dx > 0:
+            return Direction.EAST
+        if dx < 0:
+            return Direction.WEST
+        return Direction.CENTER
+    if ady >= 2.414 * adx:
+        return Direction.NORTH if dy > 0 else Direction.SOUTH
+    if dy > 0:
+        return Direction.NORTHEAST if dx > 0 else Direction.NORTHWEST
+    return Direction.SOUTHEAST if dx > 0 else Direction.SOUTHWEST
+
+
+def nav_dist_sq(a, b):
+    """Squared Euclidean distance, computed locally (no engine call)."""
+    dx = a.x - b.x
+    dy = a.y - b.y
+    return dx * dx + dy * dy
+
+
+def nav_reset():
+    """Forget obstacle-following state (call when you pick a new target)."""
+    _nav["target"] = None
+    _nav["following"] = False
+    _nav["heading"] = None
+    _nav["follow_turns"] = 0
+
+
+def _nav_step(d):
+    """Move one tile in direction d. Baby rats turn first so they pay the
+    forward move cost (10) instead of the strafe cost (18)."""
+    if not rc.can_move(d):
+        return False
+    if rc.get_type().is_baby_rat_type() and rc.get_direction() != d and rc.can_turn(d):
+        rc.turn(d)
+    rc.move(d)
+    return True
+
+
+def move_to(target, arrive_dist_sq=0, dig=False):
+    """Take ONE step from the current location toward `target` (a MapLocation).
+
+    Call it once per turn, every turn, until it reports arrival.
+
+    Returns:
+        True  -> we are already within `arrive_dist_sq` of target (arrived)
+        False -> not there yet (moved one step, or could not move this turn)
+
+    arrive_dist_sq: stop when distance_squared <= this. Use 2 to stop adjacent
+                    (e.g. when the target tile holds a robot).
+    dig:            if True, a baby rat / rat king will dig through dirt that
+                    blocks the direct path (costs 5 cheese + 25 action cooldown).
+    """
+    me = rc.get_location()
+    if nav_dist_sq(me, target) <= arrive_dist_sq:
+        return True
+
+    key = (target.x, target.y)
+    if _nav["target"] != key:
+        nav_reset()
+        _nav["target"] = key
+
+    if not rc.is_movement_ready():
+        return False
+
+    d = nav_dir_toward(me, target)
+    cur = nav_dist_sq(me, target)
+
+    # 1) Greedy: go straight at the target, or 45 degrees either side, as long
+    #    as that actually gets us closer. Leave obstacle-following if possible.
+    if not _nav["following"] or cur < _nav["start_dist"]:
+        for cand in (d, d.rotate_left(), d.rotate_right()):
+            if nav_dist_sq(me.add(cand), target) < cur and _nav_step(cand):
+                _nav["following"] = False
+                return False
+
+        # Optional: dig through dirt that sits directly in the way.
+        if dig:
+            ahead = me.add(d)
+            if rc.can_remove_dirt(ahead):
+                rc.remove_dirt(ahead)
+                return False
+
+        # Blocked -> start hugging the obstacle.
+        if not _nav["following"]:
+            _nav["following"] = True
+            # Pre-rotate so that the first sweep below starts exactly at d.
+            if _nav["left_hand"]:
+                _nav["heading"] = d.rotate_left().rotate_left()
+            else:
+                _nav["heading"] = d.rotate_right().rotate_right()
+            _nav["start_dist"] = cur
+            _nav["follow_turns"] = 0
+
+    # 2) Obstacle following (bug navigation). Start pointing back into the
+    #    wall and sweep away from it until a free direction is found.
+    _nav["follow_turns"] += 1
+    if _nav["follow_turns"] > 2 * (rc.get_map_width() + rc.get_map_height()):
+        # Going around the long way for too long: switch hands and retry.
+        _nav["left_hand"] = not _nav["left_hand"]
+        _nav["following"] = False
+        _nav["follow_turns"] = 0
+        return False
+
+    h = _nav["heading"]
+    if _nav["left_hand"]:
+        h = h.rotate_right().rotate_right()      # wall is on our right
+        for _ in range(8):
+            if _nav_step(h):
+                _nav["heading"] = h
+                return False
+            h = h.rotate_left()
     else:
-
-        log("Cannot move north")
+        h = h.rotate_left().rotate_left()        # wall is on our left
+        for _ in range(8):
+            if _nav_step(h):
+                _nav["heading"] = h
+                return False
+            h = h.rotate_right()
+    return False   # completely boxed in this turn; try again next turn
 ```
 
-## 25.3 Find an Enemy
-
-Use nearby robot sensing and compare teams.
+Usage:
 
 ```python
-def find_enemy():
+TARGET = MapLocation(20, 30)
 
-    my_team = rc.get_team()
+def turn():
+    if move_to(TARGET):
+        log("arrived at", TARGET)
 
-    robots = rc.sense_nearby_robots()
-
-    for robot in robots:
-
-        if robot.team != my_team:
-
-            log("Enemy found:", robot.id)
-
-            return robot
-
-    return None
+    # Stop next to a robot instead of on top of it:
+    # move_to(enemy_king.location, arrive_dist_sq=2)
 ```
 
-## 25.4 Attack an Enemy
+Notes:
+- Works for baby rats and rat kings (a king needs a 3-tile-wide gap; `rc.can_move` checks that).
+- Enemy traps are invisible to you (section 4.7), so the path may still walk into one.
+- Only one step per turn is possible. A baby rat walking forward has cooldown 10, so it moves every turn; a rat king (cooldown 40) moves about once every 4 turns.
+
+## 17.2 Find and bite the nearest enemy
 
 ```python
-def attack_enemy():
+def bite_nearest_enemy():
+    me = rc.get_location()
+    best = None
+    best_d = 1000000
+    for r in rc.sense_nearby_robots(radius_squared=-1, team=rc.get_team().opponent()):
+        dx = r.location.x - me.x
+        dy = r.location.y - me.y
+        d = dx * dx + dy * dy
+        if d < best_d:
+            best, best_d = r, d
+    if best is None:
+        return False
+    if rc.can_attack(best.location):
+        rc.attack(best.location)
+        return True
+    move_to(best.location, arrive_dist_sq=2)
+    return False
+```
 
-    enemy = find_enemy()
+## 17.3 Collect cheese and bring it home
 
-    if enemy is None:
+```python
+def gather(king_loc):
+    me = rc.get_location()
+    if rc.get_raw_cheese() > 0 and rc.can_transfer_cheese(king_loc, rc.get_raw_cheese()):
+        rc.transfer_cheese(king_loc, rc.get_raw_cheese())
         return
-
-    if rc.can_attack(enemy.location):
-
-        rc.attack(enemy.location)
+    for info in rc.sense_nearby_map_infos():
+        if info.cheese_amount > 0:
+            if rc.can_pick_up_cheese(info.location):
+                rc.pick_up_cheese(info.location)
+            else:
+                move_to(info.location)
+            return
+    move_to(king_loc, arrive_dist_sq=9)
 ```
 
-This example assumes the enemy information is still valid when the attack is attempted. The `can_attack` method is used as the immediate legality check.
-
-## 25.5 Inspect Nearby Map Tiles
+## 17.4 Rat king publishes its location to the team
 
 ```python
-def inspect_map():
+# Rat king (only kings may write). Slots 0 and 1 hold the king's x and y.
+loc = rc.get_location()
+rc.write_shared_array(0, loc.x)
+rc.write_shared_array(1, loc.y)
 
-    map_infos = rc.sense_nearby_map_infos()
-
-    for info in map_infos:
-
-        log("Location:", info.location)
-        log("Passable:", info.is_passable)
-        log("Wall:", info.is_wall)
-        log("Dirt:", info.is_dirt)
-        log("Cheese:", info.cheese_amount)
+# Any robot on the team:
+king = MapLocation(rc.read_shared_array(0), rc.read_shared_array(1))
 ```
 
-## 25.6 Check Whether a Location Is on the Map
+## 17.5 Debug drawing that works
 
 ```python
-def check_location(x, y):
-
-    location = MapLocation(x, y)
-
-    if rc.on_the_map(location):
-
-        log("Valid map location")
-
-    else:
-
-        log("Outside the map")
-```
-
-## 25.7 Read Shared Information
-
-```python
-def read_team_data():
-
-    value = rc.read_shared_array(0)
-
-    log("Team data:", value)
-```
-
-## 25.8 Write Shared Information
-
-```python
-def write_team_data(value):
-
-    rc.write_shared_array(0, value)
-```
-
-## 25.9 Display Debugging Information
-
-```python
-def debug_information():
-
-    location = rc.get_location()
-
-    rc.set_indicator_string(
-        "Round: " + str(rc.get_round_num())
-    )
-
-    rc.set_indicator_dot(
-        location,
-        255,
-        0,
-        0
-    )
+me = rc.get_location()
+rc.set_indicator_string("round " + str(rc.get_round_num()))
+rc.set_indicator_line(me, me, 255, 0, 0)          # dot substitute (set_indicator_dot is broken)
+rc.set_indicator_line(me, TARGET, 0, 255, 0)      # line to the target
 ```
 
 ---
 
-# 26. Important Wrapper Details
+# 18. Recommended Learning Order
 
-The following details come directly from the supplied `wrappers.py` implementation.
-
-## 26.1 RobotController Uses Static Methods
-
-The wrapper defines `RobotController` with static methods.
-
-It also provides:
-
-```python
-rc = RobotController
-```
-
-Therefore, use:
-
-```python
-rc.get_location()
-```
-
-rather than creating an instance.
-
-## 26.2 Engine Communication
-
-The wrapper imports:
-
-```python
-CrossPlayMethod
-send_wait_and_parse
-```
-
-from its crossplay module.
-
-Each RobotController method sends a request to the engine using the corresponding method identifier.
-
-The wrapper is therefore an interface to the engine rather than an independent implementation of the game rules.
-
-## 26.3 `can_turn` Supports Two Forms
-
-Both forms are supported:
-
-```python
-rc.can_turn()
-```
-
-```python
-rc.can_turn(Direction.NORTH)
-```
-
-## 26.4 `pick_up_cheese` Supports Two Forms
-
-Both forms are supported:
-
-```python
-rc.pick_up_cheese(location)
-```
-
-```python
-rc.pick_up_cheese(location, amount)
-```
-
-The wrapper uses different engine method identifiers depending on whether the amount is supplied.
-
-## 26.5 `sense_nearby_map_infos` Argument Combinations
-
-The supplied wrapper supports:
-
-```python
-rc.sense_nearby_map_infos()
-```
-
-```python
-rc.sense_nearby_map_infos(center)
-```
-
-```python
-rc.sense_nearby_map_infos(radius_squared=20)
-```
-
-```python
-rc.sense_nearby_map_infos(
-    center,
-    radius_squared=20
-)
-```
-
-## 26.6 `sense_nearby_robots` Argument Combinations
-
-The supplied wrapper supports:
-
-```python
-rc.sense_nearby_robots()
-```
-
-```python
-rc.sense_nearby_robots(radius_squared=20)
-```
-
-```python
-rc.sense_nearby_robots(
-    radius_squared=20,
-    team=Team.A
-)
-```
-
-```python
-rc.sense_nearby_robots(
-    center,
-    radius_squared=20,
-    team=Team.A
-)
-```
-
-Other combinations raise `ValueError`.
-
-## 26.7 GameConstants Are Reference Values
-
-The `GameConstants` docstring states that modifying these constants on the Python side does not affect the game.
-
----
-
-# 27. What This API Reference Does Not Establish
-
-The supplied `wrappers.py` and `classes.py` provide the Python-facing interface and the data exposed by the package.
-
-They do not, by themselves, fully establish:
-
-- The complete legality conditions for every action.
-- Every action's exact resource cost.
-- Every action's cooldown interactions.
-- The complete sensing and visibility rules.
-- Every distance and angle boundary condition.
-- The full meaning of every engine-side field.
-- The exact behavior of every game mechanic.
-- Whether a method's behavior has changed in another package version.
-
-For those details, consult the official Battlecode 2026 rules and the matching engine implementation.
-
-This distinction is important: a method signature tells you how to call a method, but does not necessarily explain all the rules governing that method.
-
----
-
-# 28. Recommended Learning Order
-
-If you are learning the 2026 API, the following order is recommended.
-
-| Step | Topic | Why it matters |
+| Step | Topic | Sections |
 |---|---|---|
-| 1 | `Direction`, `MapLocation`, `Team`, `UnitType` | These types are used throughout the API. |
-| 2 | Game state methods | Learn how to identify your robot and its position. |
-| 3 | Movement and cooldowns | Learn how to move and manage readiness. |
-| 4 | Sensing methods | Learn how to inspect the map and nearby robots. |
-| 5 | `RobotInfo` and `MapInfo` | Understand the information returned by sensing. |
-| 6 | Combat and robot interactions | Learn how to attack, build, carry, and throw. |
-| 7 | Cheese, dirt, and traps | Understand the resource and trap interfaces. |
-| 8 | Shared arrays and squeaks | Learn how robots can communicate. |
-| 9 | Indicators and logging | Make debugging easier. |
-| 10 | Constants and exceptions | Improve understanding of game limits and error handling. |
-
----
-
-# 29. Final Reference Summary
-
-The supplied `battlecode26 1.2.2` Python wrapper exposes the following major API groups.
-
-| Category | Main functionality |
-|---|---|
-| Game state | Round, map dimensions, robot identity, health, location |
-| Map | Location checks, occupancy, adjacent locations |
-| Movement | Move, move forward, turn, readiness, cooldowns |
-| Sensing | Nearby robots, map information, robot information, passability |
-| Combat | Attack, rat king transformation |
-| Robot interactions | Build, carry, drop, throw |
-| Cheese | Pick up, transfer, inspect amounts |
-| Dirt | Place and remove dirt |
-| Traps | Place and remove rat traps and cat traps |
-| Communication | Shared array and squeak messages |
-| Indicators | Dots, lines, strings, timeline markers |
-| Helpers | Distance, direction, adjacency, location queries |
-| Exceptions | Game action exception categories |
-| Constants | Map, resource, cooldown, combat, and communication values |
-
-**Main takeaway:** `RobotController` is the primary interface between your Python bot and the Battlecode 2026 game engine. Learn the core types first, then movement and sensing, followed by actions and communication. Always use the supplied wrapper signatures and verify game-rule details against the official 2026 specification.
+| 1 | Sandbox rules (builtins, imports, per-robot globals) | 1 |
+| 2 | Known bugs and stale constants | 3 |
+| 3 | `Direction`, `MapLocation`, coordinates | 2, 4.2, 4.3 |
+| 4 | Your own state: location, type, cheese | 0.1, 5, 6 |
+| 5 | Cooldowns, movement, turning | 8 |
+| 6 | Vision cone and sensing | 7 |
+| 7 | Navigation pattern | 17.1 |
+| 8 | Cheese economy, building, kings | 9, 11 |
+| 9 | Combat and carrying | 10 |
+| 10 | Communication | 0.2, 12 |

@@ -17,7 +17,7 @@ if(JavaVersion.current() < JavaVersion.VERSION_21) {
 // Directory layout.
 sourceSets {
   main {
-    java.srcDirs = ["src"]
+    java.srcDirs = ["src", "../Battlecode26/src/Version41"]
     java.includes = ["**/*.java"]
     java.destinationDirectory.set(file("$buildDir/classes"))
 
@@ -313,7 +313,7 @@ task runJavaLocal(type: JavaExec) {
     '--add-opens=java.base/sun.security.action=ALL-UNNAMED',
     '-Dbc.server.wait-for-client=' + (project.findProperty('waitForClient') ?: 'false'),
     '-Dbc.server.mode=headless',
-    '-Dbc.server.map-path=maps',
+    '-Dbc.server.map-path=' + (project.findProperty('mapPath') ?: 'maps'),
     '-Dbc.server.robot-player-to-system-out=' + (project.findProperty('outputVerbose') ?: 'true'),
     '-Dbc.server.debug=false',
     '-Dbc.engine.debug-methods=' + (project.findProperty('debug') ?: 'false'),
