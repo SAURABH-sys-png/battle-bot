@@ -1,5 +1,5 @@
 from battlecode26 import *
-
+from algorithms import *
 
 DIRECTIONS = [
     Direction.NORTH,
@@ -23,10 +23,6 @@ def squeek_to_distract():
 
 
 def has_cheese_nearby():
-    return 1
-
-
-def move_towards_location(cheese_location: MapLocation):
     return 1
 
 
@@ -65,7 +61,7 @@ def pick_cheese(cheese_location: MapLocation):
     if rc.can_pick_up_cheese(cheese_location):
         rc.pick_up_cheese(cheese_location)
     else:
-        move_towards_location(cheese_location)
+        find_nxt_move(rc.get_location(), cheese_location)
 
 
 def baby_rat_exploration(curr_dir: Direction):
@@ -120,35 +116,10 @@ def direction_between(dx, dy):
     return Direction.CENTER
 
 
-def return_to_boss():
-    boss_x = rc.read_shared_array(1)
-    boss_y = rc.read_shared_array(2)
-    # move towards boss_x
-    me = rc.get_location()
-
-    if distance_squared_between(me.x, me.y, boss_x, boss_y) <= 2:
-        return Direction.CENTER
-
-    head = direction_between(boss_x - me.x, boss_y - me.y)
-    if rc.can_move(head):
-        rc.move(head)
-        return head
-
-    right, left = head, head
-    for i in range(3):
-        right = right.rotate_right()
-        left = left.rotate_left()
-        for nxt in (right, left):
-            if rc.can_move(nxt):
-                rc.move(nxt)
-                return nxt
-    return None
-
-
 def proces_baby_rat(cheese_count: int):
     if cheese_count > 0:
-        return_to_boss()
+        bbs_loc = MapLocation(rc.read_shared_array(0), rc.read_shared_array(1))
+        find_nxt_move(rc.get_location(), bbs_loc)
     else:
         pick_cheese_nearby()
         baby_rat_exploration(rc.get_direction())
-

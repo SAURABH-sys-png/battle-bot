@@ -1,6 +1,7 @@
 from battlecode26 import *
 from baby_rat import baby_rat_exploration, proces_baby_rat
 from rat_king import *
+
 #  in the shared array kings health gets stored at index number 0 and put them in one array of max 5 so basically it is 0,1,2,3,4,5
 #  if the king is under attack also
 #
@@ -35,5 +36,5 @@ def turn():
     if rc.get_type().is_baby_rat_type():
         proces_baby_rat(curr_raw_cheese)
     else:
-        spawn_baby_rat()
-        rat_king_exploration(curr_dir)
+        process_rat_king(curr_location)
+    # rat_king_exploration(curr_dir)

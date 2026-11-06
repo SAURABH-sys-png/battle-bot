@@ -1,5 +1,5 @@
 from battlecode26 import *
-
+from algorithms import find_nxt_move
 
 DIRECTIONS = [
     Direction.NORTH,
@@ -48,7 +48,6 @@ for dx in range(-2, 3):
 
 
 def spawn_baby_rat():
-    """Try to spawn one baby rat. Returns True if one was spawned."""
     if not rc.is_action_ready():
         return False
     if rc.get_global_cheese() < rc.get_current_rat_cost():
@@ -62,3 +61,20 @@ def spawn_baby_rat():
             log("spawned baby rat at", loc, "cost was", rc.get_current_rat_cost())
             return True
     return False
+
+
+# we store the location of the base on last 2 indices
+def process_rat_king(curr_loc: MapLocation):
+    turn_count = rc.get_round_num()
+    if turn_count == 1:
+        spawn_baby_rat()
+        rc.write_shared_array(0, curr_loc.x)
+        rc.write_shared_array(1, curr_loc.y)
+    if turn_count <= 15:
+        # try to and forth to the base coordinates
+        spawn_baby_rat()
+        rat_king_exploration(rc.get_direction())
+    else:
+        base_loc = MapLocation(rc.read_shared_array(0), rc.read_shared_array(1))
+        find_nxt_move(curr_loc, base_loc)
+    return
